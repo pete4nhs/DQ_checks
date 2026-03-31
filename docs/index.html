@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>IAP DQ checks</title>
+
+    <!-- stlite CSS -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.80.5/build/style.css"
+    />
+
+    <!-- SheetJS (Excel parsing in browser) -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+
+    <script type="module">
+      import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.80.5/build/stlite.js";
+
+      // ------------------------------------------------------------
+      // Excel -> CSV helper exposed to Python
+      // ------------------------------------------------------------
+      window.excelToCsv = async (file, sheetName) => {
+        const data = await file.arrayBuffer();
+        const workbook = XLSX.read(data, { type: "array" });
+
+        const chosenSheet =
+          sheetName && workbook.SheetNames.includes(sheetName)
+            ? sheetName
+            : workbook.SheetNames[0];
+
+        const worksheet = workbook.Sheets[chosenSheet];
+        const csv = XLSX.utils.sheet_to_csv(worksheet, {
+          blankrows: false,
+        });
+
+        return csv;
+      };
+
+      // ------------------------------------------------------------
+      // Mount stlite app
+      // ------------------------------------------------------------
+mount({
+  entrypoint: "IAP_Checks.py",
+  requirements: [],
+  files: {
+    "IAP_Checks.py": `
+import streamlit as st
+import pandas as pd
+import io
+
+# ---------------------- Page config ----------------------
+st.set_page_config(
+    page_title="IAP DQ checks",
+    layout="wide",
+)
+
+# ---------------------- Session state initialisation ----------------------
+if "final_df" not in st.session_state:
+    st.session_state.final_df = None
+if "csv_bytes" not in st.session_state:
+    st.session_state.csv_bytes = None
+if "calc_done" not in st.session_state:
+    st.session_state.calc_done = False
+if "show_preview" not in st.session_state:
+    st.session_state.show_preview = False
+if "sheet_name" not in st.session_state:
+    st.session_state.sheet_name = None
+
+# ---------------------- Header ----------------------
+st.title("Automated Indicative Activity Plans (IAP) DQ checks")
+
+# ---------------------- File upload ----------------------
+uploaded_lpr = st.file_uploader(
+    "📤 Upload your CSV or Excel (.xlsx) file",
+    type=["csv", "xlsx"],
+)
+
+# ---------------------- File handling ----------------------
+if uploaded_lpr is not None:
+    if uploaded_lpr.name.lower().endswith(".csv"):
+        st.session_state.csv_bytes = uploaded_lpr.getvalue()
+        st.success("CSV file uploaded")
+
+    elif uploaded_lpr.name.lower().endswith(".xlsx"):
+        st.info("Excel file detected. Converting to CSV in the browser.")
+
+        sheet = st.text_input(
+            "Sheet name (leave blank for first sheet)",
+            value=st.session_state.sheet_name or ""
+        )
+
+        st.session_state.sheet_name = sheet or None
+
+        csv_text = stlite.call(
+            "excelToCsv",
+            uploaded_lpr,
+            st.session_state.sheet_name
+        )
+
+        st.session_state.csv_bytes = csv_text.encode("utf-8")
+        st.success("Excel converted successfully")
+
+# ---------------------- Run checks ----------------------
+if st.button("Run checks", type="primary"):
+    if st.session_state.csv_bytes is None:
+        st.warning("Please upload a CSV or Excel file before running checks.")
+        st.stop()
+
+    try:
+        with st.spinner("Running calculations..."):
+            df = pd.read_csv(io.BytesIO(st.session_state.csv_bytes))
+
+            # ---- YOUR EXISTING VALIDATION LOGIC STARTS HERE ----
+            # (no changes needed below this point)
+
+            columns = pd.Series([
+                'FINANCIAL YEAR',
+                'DATE AND TIME DATA SET CREATED',
+                'ORGANISATION IDENTIFIER (CODE OF PROVIDER)',
+                'ORGANISATION SITE IDENTIFIER (OF TREATMENT)',
+                'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)',
+                'ACTIVITY TREATMENT FUNCTION CODE',
+                'LOCAL SUB-SPECIALTY CODE',
+                'COMMISSIONING SERIAL NUMBER',
+                'PROVIDER REFERENCE IDENTIFIER',
+                'NHS SERVICE AGREEMENT LINE NUMBER',
+                'COMMISSIONED SERVICE CATEGORY CODE',
+                'SERVICE CODE',
+                'POINT OF DELIVERY CODE',
+                'POINT OF DELIVERY FURTHER DETAIL CODE',
+                'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION',
+                'LOCAL POINT OF DELIVERY CODE',
+                'LOCAL POINT OF DELIVERY DESCRIPTION',
+                'TARIFF CODE',
+                'LOCAL PRICE'
+            ], name="Column_name")
+
+            requirement = columns.map(REQUIREMENT_MAP).rename("Requirement")
+
+            status = pd.Series([
+                to_1_based_indices(validate_year_columns(df)),
+                to_1_based_indices(validate_datetime_columns(df)),
+                to_1_based_indices(validate_cop_columns(df)),
+                to_1_based_indices(validate_of_treatment_columns(df)),
+                to_1_based_indices(validate_commissioner_code_columns(df)),
+                to_1_based_indices(validate_activity_TFC_columns(df)),
+                to_1_based_indices(validate_local_sub_columns(df)),
+                to_1_based_indices(validate_comm_serial_n_columns(df)),
+                to_1_based_indices(validate_provider_ref_identifier_columns(df)),
+                to_1_based_indices(validate_nhs_service_cat_n_columns(df)),
+                to_1_based_indices(validate_commissioned_service_code_columns(df)),
+                to_1_based_indices(validate_service_code_columns(df)),
+                to_1_based_indices(validate_pod_code_columns(df)),
+                to_1_based_indices(validate_pod_further_detail_code_columns(df)),
+                to_1_based_indices(validate_pod_further_detail_desc_columns(df)),
+                to_1_based_indices(validate_local_pod_code_columns(df)),
+                to_1_based_indices(validate_local_pod_desc_columns(df)),
+                to_1_based_indices(validate_tariff_code_columns(df)),
+                to_1_based_indices(validate_local_price_columns(df)),
+            ], name="Status")
+
+            final_df = pd.concat([columns, requirement, status], axis=1)
+
+            st.session_state.final_df = final_df
+            st.session_state.csv_bytes = final_df.to_csv(index=False).encode("utf-8")
+            st.session_state.calc_done = True
+            st.session_state.show_preview = False
+
+    except Exception as e:
+        st.error(f"Something went wrong while running checks: {e}")
+
+# ---------------------- Results ----------------------
+if st.session_state.calc_done and st.session_state.final_df is not None:
+    st.subheader("Results")
+
+    if st.button("👁️ View results"):
+        st.session_state.show_preview = True
+
+    st.download_button(
+        label="⬇️ Download CSV",
+        data=st.session_state.csv_bytes,
+        file_name="Analysed IAP DQ checks.csv",
+        mime="text/csv",
+    )
+
+    if st.session_state.show_preview:
+        styled = style_results_table(st.session_state.final_df)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+else:
+    st.info("Please upload a CSV or Excel file and click Run checks.")
+`
+  },
+});
+``
