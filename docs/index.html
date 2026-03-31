@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>IAP DQ checks</title>
+
+    <!-- stlite CSS -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.80.5/build/style.css"
+    />
+
+    <!-- SheetJS (Excel parsing in browser) -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="root"></div>
+
+    <script type="module">
+      import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.80.5/build/stlite.js";
+
+      // ------------------------------------------------------------
+      // Excel -> CSV helper exposed to Python
+      // ------------------------------------------------------------
+      window.excelToCsv = async (file, sheetName) => {
+        const data = await file.arrayBuffer();
+        const workbook = XLSX.read(data, { type: "array" });
+
+        const chosenSheet =
+          sheetName && workbook.SheetNames.includes(sheetName)
+            ? sheetName
+            : workbook.SheetNames[0];
+
+        const worksheet = workbook.Sheets[chosenSheet];
+        const csv = XLSX.utils.sheet_to_csv(worksheet, {
+          blankrows: false,
+        });
+
+        return csv;
+      };
+
+      // ------------------------------------------------------------
+      // Mount stlite app
+      // ------------------------------------------------------------
+      mount({
+        entrypoint: "IAP_Checks.py",
+        requirements: [],
+        files: {
+          "IAP_Checks.py": `
+import streamlit as st
+import pandas as pd
+import io
+
+# ---------------------- Page config ----------------------
+st.set_page_config(
+    page_title="IAP DQ checks",
+    layout="wide",
+)
+
+# ---------------------- Session state ----------------------
+if "csv_bytes" not in st.session_state:
+    st.session_state.csv_bytes = None
+
+# ---------------------- UI ----------------------
+st.title("Automated Indicative Activity Plans (IAP) DQ checks")
+
+uploaded = st.file_uploader(
+    "Upload CSV or Excel (.xlsx)",
+    type=["csv", "xlsx"],
+)
+
+sheet_name = None
+
+# ---------------------- File handling ----------------------
+if uploaded is not None:
+    if uploaded.name.lower().endswith(".csv"):
+        st.session_state.csv_bytes = uploaded.getvalue()
+
+    elif uploaded.name.lower().endswith(".xlsx"):
+        st.info("Excel file detected. Converting to CSV in the browser.")
+
+        sheet_name = st.text_input(
+            "Sheet name (leave blank for first sheet)",
+            value=""
+        )
+
+        csv_text = stlite.call(
+            "excelToCsv",
+            uploaded,
+            sheet_name if sheet_name else None
+        )
+
+        st.session_state.csv_bytes = csv_text.encode("utf-8")
+
+# ---------------------- Read CSV into pandas ----------------------
+if st.session_state.csv_bytes:
+    df = pd.read_csv(io.BytesIO(st.session_state.csv_bytes))
+
+    st.success("File loaded successfully")
+    st.dataframe(df.head(50))
+
+    # ---- Your DQ checks start here ----
+    st.write("Rows:", len(df))
+    st.write("Columns:", list(df.columns))
+
+
+
+
+
+
+
+
+
+# ---------------------- Validators (logic aligned with your latest rules) ----------------------
+
+# --------------------- FINANCIAL MONTH (mandatory)
+def validate_month_column(df):
+    col = 'FINANCIAL MONTH'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 2]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+
+# --------------------- FINANCIAL YEAR (mandatory)
+def validate_year_columns(df):
+    col = 'FINANCIAL YEAR'
+    if col not in df.columns:
+        return "Error: 'FINANCIAL YEAR' column not found in the data."
+    s = df[col].astype(str)
+    invalid = df[(s.str.len() != 6) | (s.str.contains('/', na=False, regex=False))]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- DATE AND TIME DATA SET CREATED (mandatory)
+def validate_datetime_columns(df):
+    col = 'DATE AND TIME DATA SET CREATED'
+    if col not in df.columns:
+        return "Error: 'DATE AND TIME DATA SET CREATED' column not found in the data."
+    df[col] = df[col].astype(str)
+    pattern = r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'
+    invalid = df[~df[col].str.match(pattern, na=False)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ORGANISATION IDENTIFIER (CODE OF PROVIDER) (mandatory)
+def validate_cop_columns(df):
+    col = 'ORGANISATION IDENTIFIER (CODE OF PROVIDER)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[df[col].astype(str).str.len() < 3]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 6]])
+    invalid = pd.concat([invalid, df[df[col].str.endswith('00', na=False)]])
+    invalid = pd.concat([invalid, df[df[col].isnull()]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ORGANISATION SITE IDENTIFIER (OF TREATMENT) (mandatory where relevant)
+def validate_of_treatment_columns(df):
+    col = 'ORGANISATION SITE IDENTIFIER (OF TREATMENT)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() < 5]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 9]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ORGANISATION IDENTIFIER (CODE OF COMMISSIONER) (mandatory)
+def validate_commissioner_code_columns(df):
+    col = 'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[df[col].isna()]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() < 3]])
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 5]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ACTIVITY TREATMENT FUNCTION CODE (mandatory where relevant)
+def validate_activity_TFC_columns(df):
+    req_cols = ['ACTIVITY TREATMENT FUNCTION CODE', 'POINT OF DELIVERY CODE']
+    for c in req_cols:
+        if c not in df.columns:
+            return f"Error: '{c}' column not found in the data."
+    
+    tfc_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
+    tfc = pd.read_csv(tfc_URL)
+
+
+    #tfc_df = pd.read_csv(r"reference_tables/TFC.csv")
+    valid_codes = set(tfc.iloc[:, 0].dropna().astype(str))
+    df['ACTIVITY TREATMENT FUNCTION CODE'] = df['ACTIVITY TREATMENT FUNCTION CODE'].astype(str)
+    allowed_pod_values = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER"}
+    invalid = df[
+        (~df['ACTIVITY TREATMENT FUNCTION CODE'].isin(valid_codes)) &
+        (~df['POINT OF DELIVERY CODE'].isin(allowed_pod_values))    ]
+    return invalid
+
+# --------------------- LOCAL SUB-SPECIALTY CODE (optional)
+def validate_local_sub_columns(df):
+    col = 'LOCAL SUB-SPECIALTY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 8]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- COMMISSIONING SERIAL NUMBER (optional)
+def validate_comm_serial_n_columns(df):
+    col = 'COMMISSIONING SERIAL NUMBER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 6]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- PROVIDER REFERENCE IDENTIFIER (optional)
+def validate_provider_ref_identifier_columns(df):
+    col = 'PROVIDER REFERENCE IDENTIFIER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 20]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- NHS SERVICE AGREEMENT LINE NUMBER (optional)
+def validate_nhs_service_cat_n_columns(df):
+    col = 'NHS SERVICE AGREEMENT LINE NUMBER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- COMMISSIONED SERVICE CATEGORY CODE (mandatory)
+def validate_commissioned_service_code_columns(df):
+    col = 'COMMISSIONED SERVICE CATEGORY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[df[col].isna()]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() != 2]])
+    
+    svc_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Service_Codes.csv")
+    svc = pd.read_csv(svc_URL)
+
+
+    valid_codes = set(svc.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- SERVICE CODE (mandatory where relevant)
+def validate_service_code_columns(df):
+    col = 'SERVICE CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df['TARIFF CODE'].isna()]
+    invalid = invalid[invalid['TARIFF CODE'].astype(str).str.len() > 12]
+        
+    del_serv_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Delegationservices_v38.csv")
+    del_serv = pd.read_csv(del_serv_URL)
+
+    #del_df = pd.read_csv(r"reference_tables/Delegationservices_v38.csv")
+    valid_codes = set(del_serv.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- POINT OF DELIVERY CODE (mandatory)
+def validate_pod_code_columns(df):
+    col = 'POINT OF DELIVERY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+
+    NPOD_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
+    npod = pd.read_csv(NPOD_URL)
+
+
+    #npod = pd.read_csv(r'reference_tables/NPOD.csv')
+    valid_codes = set(npod.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- POINT OF DELIVERY FURTHER DETAIL CODE (mandatory where relevant)
+def validate_pod_further_detail_code_columns(df):
+    col = 'POINT OF DELIVERY FURTHER DETAIL CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- POINT OF DELIVERY FURTHER DETAIL DESCRIPTION (mandatory where relevant)
+def validate_pod_further_detail_desc_columns(df):
+    col = 'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 100]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL POINT OF DELIVERY CODE (optional)
+def validate_local_pod_code_columns(df):
+    col = 'LOCAL POINT OF DELIVERY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 50]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL POINT OF DELIVERY DESCRIPTION (optional)
+def validate_local_pod_desc_columns(df):
+    col = 'LOCAL POINT OF DELIVERY DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 100]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- TARIFF CODE (mandatory where relevant)
+def validate_tariff_code_columns(df):
+    col = 'TARIFF CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+            
+    hrg_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
+    hrg = pd.read_csv(hrg_URL)
+
+    #hrg = pd.read_csv(r"reference_tables/HRG.csv")
+    valid_codes = set(hrg.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL PRICE (mandatory)
+def validate_local_price_columns(df):
+    col = 'LOCAL PRICE'
+    if col not in df.columns:
+        return "Error: 'LOCAL PRICE' column not found in the data."
+    series = df[col]
+    str_vals = series.astype(str)
+    is_empty_value = series.isna() | (str_vals.str.strip() == "")
+    if is_empty_value.all():
+        return "Empty"
+    invalid_mask = is_empty_value.copy()
+    non_empty = ~is_empty_value
+    vals = str_vals[non_empty].str.strip()
+    decimal_pattern_mask = vals.str.fullmatch(r"\d+(\.\d{1,2})?")
+    digit_count_ok_mask = vals.str.replace(".", "", regex=False).str.len() <= 18
+    non_empty_invalid = ~(decimal_pattern_mask & digit_count_ok_mask)
+    invalid_mask.loc[non_empty] = non_empty_invalid
+    invalid_indices = list(series.index[invalid_mask])
+    if len(invalid_indices) == 0:
+        return "Valid"
+    if len(invalid_indices) > 100:
+        return "More than 100 invalid"
+    return invalid_indices
+
+
+# ---------------------- FIELD REQUIREMENT MAP ----------------------
+REQUIREMENT_MAP = {
+    'FINANCIAL YEAR': 'mandatory',
+    'DATE AND TIME DATA SET CREATED': 'mandatory',
+    'ORGANISATION IDENTIFIER (CODE OF PROVIDER)': 'mandatory',
+    'ORGANISATION SITE IDENTIFIER (OF TREATMENT)': 'mandatory where relevant',
+    'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)': 'mandatory',
+    'ACTIVITY TREATMENT FUNCTION CODE': 'mandatory where relevant',
+    'LOCAL SUB-SPECIALTY CODE': 'optional',
+    'COMMISSIONING SERIAL NUMBER': 'optional',
+    'PROVIDER REFERENCE IDENTIFIER': 'optional',
+    'NHS SERVICE AGREEMENT LINE NUMBER': 'optional',
+    'COMMISSIONED SERVICE CATEGORY CODE': 'mandatory',
+    'SERVICE CODE': 'mandatory where relevant',
+    'POINT OF DELIVERY CODE': 'mandatory',
+    'POINT OF DELIVERY FURTHER DETAIL CODE': 'mandatory where relevant',
+    'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION': 'mandatory where relevant',
+    'LOCAL POINT OF DELIVERY CODE': 'optional',
+    'LOCAL POINT OF DELIVERY DESCRIPTION': 'optional',
+    'TARIFF CODE': 'mandatory where relevant',
+    'LOCAL PRICE': 'mandatory',
+}
+
+# ---------------------- STYLING (only Status column coloured) ----------------------
+def style_results_table(df: pd.DataFrame):
+    """
+    Colour only the 'Status' column:
+      - Blue when Status == "Valid"
+      - Red when Requirement == "mandatory" and the row is invalid or Empty
+      - Black otherwise
+    """
+    def _style_status_cell(row_slice):
+        row_idx = row_slice.name
+        req = str(df.loc[row_idx, 'Requirement']).strip().lower()
+        status = df.loc[row_idx, 'Status']
+
+        def is_invalid_or_empty(val):
+            if isinstance(val, str):
+                return val.strip() != "Valid"
+            elif isinstance(val, (list, tuple, pd.Index)):
+                return len(val) > 0
+            return True
+
+        is_valid = isinstance(status, str) and status.strip() == "Valid"
+
+        if is_valid:
+            return ['color: blue']
+        elif req == 'mandatory' and is_invalid_or_empty(status):
+            return ['color: red']
+        else:
+            return ['color: black']
+
+    return df.style.apply(_style_status_cell, axis=1, subset=['Status'])
+
+
+# ---------------------- Run checks button ----------------------
+if st.button("Run checks", type="primary"):
+    if uploaded_lpr is None:
+        st.warning("Please upload a CSV or Excel file before calculating.")
+    else:
+        try:
+            with st.spinner("Running calculations..."):
+                import asyncio
+                await asyncio.sleep(1)
+                # Read data depending on file type
+                if uploaded_lpr.name.lower().endswith(".csv"):
+                    df = pd.read_csv(uploaded_lpr)
+                    st.success("IAP CSV uploaded successfully!")
+                else:
+                    if not sheet_selected or not st.session_state.sheet_name:
+                        st.warning("Please select a sheet before running checks.")
+                        st.stop()
+                    # Rewind the buffer since ExcelFile may have read from it
+                    uploaded_lpr.seek(0)
+                    df = pd.read_excel(uploaded_lpr, sheet_name=st.session_state.sheet_name, engine="openpyxl")
+                    st.success(f"IAP Excel uploaded successfully (sheet: {st.session_state.sheet_name})!")
+
+                # Build results
+                columns = pd.Series([
+                    'FINANCIAL YEAR', 'DATE AND TIME DATA SET CREATED',
+                    'ORGANISATION IDENTIFIER (CODE OF PROVIDER)',
+                    'ORGANISATION SITE IDENTIFIER (OF TREATMENT)',
+                    'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)',
+                    'ACTIVITY TREATMENT FUNCTION CODE', 'LOCAL SUB-SPECIALTY CODE',
+                    'COMMISSIONING SERIAL NUMBER', 'PROVIDER REFERENCE IDENTIFIER',
+                    'NHS SERVICE AGREEMENT LINE NUMBER',
+                    'COMMISSIONED SERVICE CATEGORY CODE', 'SERVICE CODE',
+                    'POINT OF DELIVERY CODE', 'POINT OF DELIVERY FURTHER DETAIL CODE',
+                    'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION',
+                    'LOCAL POINT OF DELIVERY CODE', 'LOCAL POINT OF DELIVERY DESCRIPTION',
+                    'TARIFF CODE', 'LOCAL PRICE'
+                ], name='Column_name')
+
+                requirement = columns.map(REQUIREMENT_MAP).rename("Requirement")
+
+                status = pd.Series([
+                    to_1_based_indices(validate_year_columns(df)),
+                    to_1_based_indices(validate_datetime_columns(df)),
+                    to_1_based_indices(validate_cop_columns(df)),
+                    to_1_based_indices(validate_of_treatment_columns(df)),
+                    to_1_based_indices(validate_commissioner_code_columns(df)),
+                    to_1_based_indices(validate_activity_TFC_columns(df)),
+                    to_1_based_indices(validate_local_sub_columns(df)),
+                    to_1_based_indices(validate_comm_serial_n_columns(df)),
+                    to_1_based_indices(validate_provider_ref_identifier_columns(df)),
+                    to_1_based_indices(validate_nhs_service_cat_n_columns(df)),
+                    to_1_based_indices(validate_commissioned_service_code_columns(df)),
+                    to_1_based_indices(validate_service_code_columns(df)),
+                    to_1_based_indices(validate_pod_code_columns(df)),
+                    to_1_based_indices(validate_pod_further_detail_code_columns(df)),
+                    to_1_based_indices(validate_pod_further_detail_desc_columns(df)),
+                    to_1_based_indices(validate_local_pod_code_columns(df)),
+                    to_1_based_indices(validate_local_pod_desc_columns(df)),
+                    to_1_based_indices(validate_tariff_code_columns(df)),
+                    to_1_based_indices(validate_local_price_columns(df)),
+                ], name="Status")
+
+                final_df = pd.concat([columns, requirement, status], axis=1)
+
+                # Save for preview/download
+                csv = final_df.to_csv(index=False)
+                st.session_state.csv_bytes = csv.encode("utf-8")
+                st.session_state.final_df = final_df
+                st.session_state.calc_done = True
+                st.session_state.show_preview = False  # do not auto-open
+        except Exception as e:
+            st.error(f"Something went wrong while reading the file or running checks: {e}")
+
+# ---------------------- Results card (only after Run checks) ----------------------
+if st.session_state.calc_done and st.session_state.final_df is not None:
+    st.subheader("Results")
+
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div style="font-size:1.05rem; font-weight:600; line-height:1.3;">
+                Local Prices Reporting DQ results
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Preview or download the analysed results")
+
+        # Two half-width buttons
+        col1, col2 = st.columns([1, 1], vertical_alignment="top")
+        with col1:
+            if st.button("👁️ View results", key="view_results_btn", use_container_width=True):
+                st.session_state.show_preview = True
+        with col2:
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=st.session_state.csv_bytes,
+                file_name="Analysed IAP DQ checks.csv",
+                mime="text/csv",
+                key="dq_download_btn",
+                use_container_width=True
+            )
+
+    # Inline preview that persists across reruns (only Status column coloured)
+    if st.session_state.show_preview:
+        with st.container(border=True):
+            st.markdown("**This table shows which columns in your IAP Reporting are valid. If data is invalid, the Status column lists the row numbers with incorrect formatting** (if less than 100 records).")
+            styled = style_results_table(st.session_state.final_df)
+            st.dataframe(
+                styled,
+                use_container_width=True,
+                height=560,
+                hide_index=True
+            )
+            st.button("Close preview", key="close_preview_btn", on_click=lambda: st.session_state.update(show_preview=False))
+
+else:
+    st.info("Please upload a CSV or Excel file and click Run checks.")
+
+
+# ---------------------- Important note (always visible at the bottom) ----------------------
+st.write('')
+st.write('')
+st.warning("**Please note that uploading and processing DQ checks through this tool does not constitute data submission. " \
+"This tool is solely intended to assess the formatting of your file.**")
+            `,
+"pages/2_Local_Prices_Reporting_Checks.py": `
+
+import streamlit as st
+import pandas as pd
+import io
+from datetime import datetime
+import os
+
+# ---------------------- Page config (must be first) ----------------------
+st.set_page_config(
+    page_title="Local Prices Reporting DQ checks",
+    page_icon="https://www.england.nhs.uk/wp-content/themes/nhsengland/static/img/favicon.ico",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={"About": "This tool is designed to support ICBs/Trusts to check the data quality of their submission for Local Prices."},
+)
+
+# ---------------------- Session state initialisation ----------------------
+if "final_df" not in st.session_state:
+    st.session_state.final_df = None
+if "csv_bytes" not in st.session_state:
+    st.session_state.csv_bytes = None
+if "calc_done" not in st.session_state:
+    st.session_state.calc_done = False
+if "show_preview" not in st.session_state:
+    st.session_state.show_preview = False
+if "uploaded_signature" not in st.session_state:
+    st.session_state.uploaded_signature = None  # to detect file changes
+if "sheet_name" not in st.session_state:
+    st.session_state.sheet_name = None
+if "sheet_signature" not in st.session_state:
+    st.session_state.sheet_signature = None  # track sheet selection changes
+
+
+def file_signature(uploaded_file):
+    """Create a simple signature of the uploaded file to detect changes."""
+    if uploaded_file is None:
+        return None
+    try:
+        return (uploaded_file.name, uploaded_file.size, getattr(uploaded_file, "type", ""))
+    except Exception:
+        return (uploaded_file.name, getattr(uploaded_file, "size", None), "")
+
+
+def to_1_based_indices(result, limit=100):
+    
+#    Standardise validation outputs:
+#      - If "result" is a list/Index/DataFrame of row indices -> return Excel-style row numbers (1-based + header) as a unique, sorted list.
+#      - If "result" is a string (e.g., 'Valid', 'Empty', errors) -> return as-is.
+#      - If there are > limit invalid rows -> return 'More than {limit} invalid'.
+    
+    if isinstance(result, str):
+        return result
+
+    if isinstance(result, pd.DataFrame):
+        indices = result.index
+    elif isinstance(result, (list, tuple, pd.Index)):
+        indices = result
+    else:
+        return result
+
+    try:
+        uniq = sorted(set(int(i) for i in indices))
+    except Exception:
+        uniq = sorted(set(indices))
+
+    if len(uniq) == 0:
+        return "Valid"
+    if len(uniq) > limit:
+        return f"More than {limit} invalid"
+
+    # Excel-style row numbers: 0-based -> +1 (1-based) and +1 header row => +2 total
+    return [i + 2 for i in uniq]
+
+
+# ---------------------- Header ----------------------
+st.image('input_data_other/london_logos_n_name.png', width=1050)
+st.title("Automated _Local Prices_ Reporting DQ checks")
+st.write('')
+st.write('The full documentation on how to fill in the report can be found at https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/.')
+# ---------------------- File upload ----------------------
+uploaded_lpr = st.file_uploader(
+    "📤 **Upload your CSV or Excel (.xlsx) file**",
+    type=["csv", "xlsx"],
+    help="Upload your Local Prices Reporting here. You can provide the essential tab as a CSV, or select the sheet if you upload an Excel file.")
+
+# If file changes, clear previous results so the UI doesn't show stale data
+sig = file_signature(uploaded_lpr)
+if sig != st.session_state.uploaded_signature:
+    st.session_state.uploaded_signature = sig
+    st.session_state.final_df = None
+    st.session_state.csv_bytes = None
+    st.session_state.calc_done = False
+    st.session_state.show_preview = False
+    st.session_state.sheet_name = None
+    st.session_state.sheet_signature = None
+
+# If Excel uploaded, present sheet selection
+sheet_selected = False
+if uploaded_lpr is not None and uploaded_lpr.name.lower().endswith(".xlsx"):
+    try:
+        xls = pd.ExcelFile(uploaded_lpr, engine="openpyxl")
+        sheet_names = xls.sheet_names
+
+        default_idx = 0
+        if st.session_state.sheet_name in sheet_names:
+            default_idx = sheet_names.index(st.session_state.sheet_name)
+
+        st.session_state.sheet_name = st.selectbox(
+            "Select sheet name",
+            options=sheet_names,
+            index=default_idx if sheet_names else 0,
+            help="Choose the sheet that contains the Local Prices Reporting data."
+        )
+
+        current_sheet_sig = (uploaded_lpr.name, st.session_state.sheet_name)
+        if current_sheet_sig != st.session_state.sheet_signature:
+            st.session_state.sheet_signature = current_sheet_sig
+            st.session_state.final_df = None
+            st.session_state.csv_bytes = None
+            st.session_state.calc_done = False
+            st.session_state.show_preview = False
+
+        sheet_selected = True
+    except Exception as e:
+        st.error(f"Could not read sheet names from the Excel file. {e}")
+
+
+# ---------------------- Validators (logic aligned with your latest rules) ----------------------
+# --------------------- FINANCIAL YEAR (mandatory)
+def validate_year_columns(df):
+    col = 'FINANCIAL YEAR'
+    if col not in df.columns:
+        return "Error: 'FINANCIAL YEAR' column not found in the data."
+    s = df[col].astype(str)
+    invalid = df[(s.str.len() != 6) | (s.str.contains('/', na=False, regex=False))]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- DATE AND TIME DATA SET CREATED (mandatory)
+def validate_datetime_columns(df):
+    col = 'DATE AND TIME DATA SET CREATED'
+    if col not in df.columns:
+        return "Error: 'DATE AND TIME DATA SET CREATED' column not found in the data."
+    df[col] = df[col].astype(str)
+    pattern = r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'
+    invalid = df[~df[col].str.match(pattern, na=False)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ORGANISATION IDENTIFIER (CODE OF PROVIDER) (mandatory)
+def validate_cop_columns(df):
+    col = 'ORGANISATION IDENTIFIER (CODE OF PROVIDER)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[df[col].astype(str).str.len() < 3]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 6]])
+    invalid = pd.concat([invalid, df[df[col].str.endswith('00', na=False)]])
+    invalid = pd.concat([invalid, df[df[col].isnull()]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ORGANISATION SITE IDENTIFIER (OF TREATMENT) (mandatory where relevant)
+def validate_of_treatment_columns(df):
+    col = 'ORGANISATION SITE IDENTIFIER (OF TREATMENT)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() < 5]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 9]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ORGANISATION IDENTIFIER (CODE OF COMMISSIONER) (mandatory)
+def validate_commissioner_code_columns(df):
+    col = 'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[df[col].isna()]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() < 3]])
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 5]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- ACTIVITY TREATMENT FUNCTION CODE (mandatory where relevant)
+def validate_activity_TFC_columns(df):
+    req_cols = ['ACTIVITY TREATMENT FUNCTION CODE', 'POINT OF DELIVERY CODE']
+    for c in req_cols:
+        if c not in df.columns:
+            return f"Error: '{c}' column not found in the data."
+                
+    tfc_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
+    tfc = pd.read_csv(tfc_URL)
+
+    #tfc_df = pd.read_csv(r"reference_tables/TFC.csv")
+    valid_codes = set(tfc.iloc[:, 0].dropna().astype(str))
+    df['ACTIVITY TREATMENT FUNCTION CODE'] = df['ACTIVITY TREATMENT FUNCTION CODE'].astype(str)
+    allowed_pod_values = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER"}
+    invalid = df[
+        (~df['ACTIVITY TREATMENT FUNCTION CODE'].isin(valid_codes)) &
+        (~df['POINT OF DELIVERY CODE'].isin(allowed_pod_values))    ]
+    return invalid
+
+# --------------------- LOCAL SUB-SPECIALTY CODE (optional)
+def validate_local_sub_columns(df):
+    col = 'LOCAL SUB-SPECIALTY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 8]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- COMMISSIONING SERIAL NUMBER (optional)
+def validate_comm_serial_n_columns(df):
+    col = 'COMMISSIONING SERIAL NUMBER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 6]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- PROVIDER REFERENCE IDENTIFIER (optional)
+def validate_provider_ref_identifier_columns(df):
+    col = 'PROVIDER REFERENCE IDENTIFIER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 20]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- NHS SERVICE AGREEMENT LINE NUMBER (optional)
+def validate_nhs_service_cat_n_columns(df):
+    col = 'NHS SERVICE AGREEMENT LINE NUMBER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- COMMISSIONED SERVICE CATEGORY CODE (mandatory)
+def validate_commissioned_service_code_columns(df):
+    col = 'COMMISSIONED SERVICE CATEGORY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[df[col].isna()]
+    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() != 2]])
+                    
+    svc_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Service_Codes.csv")
+    svc = pd.read_csv(svc_URL)
+
+    valid_codes = set(svc.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- SERVICE CODE (mandatory where relevant)
+def validate_service_code_columns(df):
+    col = 'SERVICE CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df['TARIFF CODE'].isna()]
+    invalid = invalid[invalid['TARIFF CODE'].astype(str).str.len() > 12]
+                        
+    del_ser_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Delegationservices_v38.csv")
+    del_ser = pd.read_csv(del_ser_URL)
+
+    valid_codes = set(del_ser.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- POINT OF DELIVERY CODE (mandatory)
+def validate_pod_code_columns(df):
+    col = 'POINT OF DELIVERY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+    
+    NPOD_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
+    npod = pd.read_csv(NPOD_URL)
+
+
+    #npod = pd.read_csv(r'reference_tables/NPOD.csv')
+    valid_codes = set(npod.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- POINT OF DELIVERY FURTHER DETAIL CODE (mandatory where relevant)
+def validate_pod_further_detail_code_columns(df):
+    col = 'POINT OF DELIVERY FURTHER DETAIL CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- POINT OF DELIVERY FURTHER DETAIL DESCRIPTION (mandatory where relevant)
+def validate_pod_further_detail_desc_columns(df):
+    col = 'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 100]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL POINT OF DELIVERY CODE (optional)
+def validate_local_pod_code_columns(df):
+    col = 'LOCAL POINT OF DELIVERY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 50]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL POINT OF DELIVERY DESCRIPTION (optional)
+def validate_local_pod_desc_columns(df):
+    col = 'LOCAL POINT OF DELIVERY DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 100]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- TARIFF CODE (mandatory where relevant)
+def validate_tariff_code_columns(df):
+    col = 'TARIFF CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[~df[col].isna()]
+    invalid = invalid[invalid[col].astype(str).str.len() > 10]
+                            
+    hrg_URL = (
+    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
+    hrg = pd.read_csv(hrg_URL)
+
+    #hrg = pd.read_csv(r"reference_tables/HRG.csv")
+    valid_codes = set(hrg.iloc[:, 0].dropna().astype(str))
+    df[col] = df[col].astype(str)
+    invalid = df[~df[col].isin(valid_codes)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL PRICE (mandatory)
+def validate_local_price_columns(df):
+    col = 'LOCAL PRICE'
+    if col not in df.columns:
+        return "Error: 'LOCAL PRICE' column not found in the data."
+    series = df[col]
+    str_vals = series.astype(str)
+    is_empty_value = series.isna() | (str_vals.str.strip() == "")
+    if is_empty_value.all():
+        return "Empty"
+    invalid_mask = is_empty_value.copy()
+    non_empty = ~is_empty_value
+    vals = str_vals[non_empty].str.strip()
+    decimal_pattern_mask = vals.str.fullmatch(r"\d+(\.\d{1,2})?")
+    digit_count_ok_mask = vals.str.replace(".", "", regex=False).str.len() <= 18
+    non_empty_invalid = ~(decimal_pattern_mask & digit_count_ok_mask)
+    invalid_mask.loc[non_empty] = non_empty_invalid
+    invalid_indices = list(series.index[invalid_mask])
+    if len(invalid_indices) == 0:
+        return "Valid"
+    if len(invalid_indices) > 100:
+        return "More than 100 invalid"
+    return invalid_indices
+
+
+# ---------------------- FIELD REQUIREMENT MAP ----------------------
+REQUIREMENT_MAP = {
+    'FINANCIAL YEAR': 'mandatory',
+    'DATE AND TIME DATA SET CREATED': 'mandatory',
+    'ORGANISATION IDENTIFIER (CODE OF PROVIDER)': 'mandatory',
+    'ORGANISATION SITE IDENTIFIER (OF TREATMENT)': 'mandatory where relevant',
+    'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)': 'mandatory',
+    'ACTIVITY TREATMENT FUNCTION CODE': 'mandatory where relevant',
+    'LOCAL SUB-SPECIALTY CODE': 'optional',
+    'COMMISSIONING SERIAL NUMBER': 'optional',
+    'PROVIDER REFERENCE IDENTIFIER': 'optional',
+    'NHS SERVICE AGREEMENT LINE NUMBER': 'optional',
+    'COMMISSIONED SERVICE CATEGORY CODE': 'mandatory',
+    'SERVICE CODE': 'mandatory where relevant',
+    'POINT OF DELIVERY CODE': 'mandatory',
+    'POINT OF DELIVERY FURTHER DETAIL CODE': 'mandatory where relevant',
+    'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION': 'mandatory where relevant',
+    'LOCAL POINT OF DELIVERY CODE': 'optional',
+    'LOCAL POINT OF DELIVERY DESCRIPTION': 'optional',
+    'TARIFF CODE': 'mandatory where relevant',
+    'LOCAL PRICE': 'mandatory',
+}
+
+# ---------------------- STYLING (only Status column coloured) ----------------------
+def style_results_table(df: pd.DataFrame):
+    """
+    Colour only the 'Status' column:
+      - Blue when Status == "Valid"
+      - Red when Requirement == "mandatory" and the row is invalid or Empty
+      - Black otherwise
+    """
+    def _style_status_cell(row_slice):
+        row_idx = row_slice.name
+        req = str(df.loc[row_idx, 'Requirement']).strip().lower()
+        status = df.loc[row_idx, 'Status']
+
+        def is_invalid_or_empty(val):
+            if isinstance(val, str):
+                return val.strip() != "Valid"
+            elif isinstance(val, (list, tuple, pd.Index)):
+                return len(val) > 0
+            return True
+
+        is_valid = isinstance(status, str) and status.strip() == "Valid"
+
+        if is_valid:
+            return ['color: blue']
+        elif req == 'mandatory' and is_invalid_or_empty(status):
+            return ['color: red']
+        else:
+            return ['color: black']
+
+    return df.style.apply(_style_status_cell, axis=1, subset=['Status'])
+
+
+# ---------------------- Run checks button ----------------------
+if st.button("Run checks", type="primary"):
+    if uploaded_lpr is None:
+        st.warning("Please upload a CSV or Excel file before calculating.")
+    else:
+        try:
+            with st.spinner("Running calculations..."):
+                import asyncio
+                await asyncio.sleep(1)
+                # Read data depending on file type
+                if uploaded_lpr.name.lower().endswith(".csv"):
+                    df = pd.read_csv(uploaded_lpr)
+                    st.success("Local Prices Reporting CSV uploaded successfully!")
+                else:
+                    if not sheet_selected or not st.session_state.sheet_name:
+                        st.warning("Please select a sheet before running checks.")
+                        st.stop()
+                    # Rewind the buffer since ExcelFile may have read from it
+                    uploaded_lpr.seek(0)
+                    df = pd.read_excel(uploaded_lpr, sheet_name=st.session_state.sheet_name, engine="openpyxl")
+                    st.success(f"Local Prices Reporting Excel uploaded successfully (sheet: {st.session_state.sheet_name})!")
+
+                # Build results
+                columns = pd.Series([
+                    'FINANCIAL YEAR', 'DATE AND TIME DATA SET CREATED',
+                    'ORGANISATION IDENTIFIER (CODE OF PROVIDER)',
+                    'ORGANISATION SITE IDENTIFIER (OF TREATMENT)',
+                    'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)',
+                    'ACTIVITY TREATMENT FUNCTION CODE', 'LOCAL SUB-SPECIALTY CODE',
+                    'COMMISSIONING SERIAL NUMBER', 'PROVIDER REFERENCE IDENTIFIER',
+                    'NHS SERVICE AGREEMENT LINE NUMBER',
+                    'COMMISSIONED SERVICE CATEGORY CODE', 'SERVICE CODE',
+                    'POINT OF DELIVERY CODE', 'POINT OF DELIVERY FURTHER DETAIL CODE',
+                    'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION',
+                    'LOCAL POINT OF DELIVERY CODE', 'LOCAL POINT OF DELIVERY DESCRIPTION',
+                    'TARIFF CODE', 'LOCAL PRICE'
+                ], name='Column_name')
+
+                requirement = columns.map(REQUIREMENT_MAP).rename("Requirement")
+
+                status = pd.Series([
+                    to_1_based_indices(validate_year_columns(df)),
+                    to_1_based_indices(validate_datetime_columns(df)),
+                    to_1_based_indices(validate_cop_columns(df)),
+                    to_1_based_indices(validate_of_treatment_columns(df)),
+                    to_1_based_indices(validate_commissioner_code_columns(df)),
+                    to_1_based_indices(validate_activity_TFC_columns(df)),
+                    to_1_based_indices(validate_local_sub_columns(df)),
+                    to_1_based_indices(validate_comm_serial_n_columns(df)),
+                    to_1_based_indices(validate_provider_ref_identifier_columns(df)),
+                    to_1_based_indices(validate_nhs_service_cat_n_columns(df)),
+                    to_1_based_indices(validate_commissioned_service_code_columns(df)),
+                    to_1_based_indices(validate_service_code_columns(df)),
+                    to_1_based_indices(validate_pod_code_columns(df)),
+                    to_1_based_indices(validate_pod_further_detail_code_columns(df)),
+                    to_1_based_indices(validate_pod_further_detail_desc_columns(df)),
+                    to_1_based_indices(validate_local_pod_code_columns(df)),
+                    to_1_based_indices(validate_local_pod_desc_columns(df)),
+                    to_1_based_indices(validate_tariff_code_columns(df)),
+                    to_1_based_indices(validate_local_price_columns(df)),
+                ], name="Status")
+
+                final_df = pd.concat([columns, requirement, status], axis=1)
+
+                # Save for preview/download
+                csv = final_df.to_csv(index=False)
+                st.session_state.csv_bytes = csv.encode("utf-8")
+                st.session_state.final_df = final_df
+                st.session_state.calc_done = True
+                st.session_state.show_preview = False  # do not auto-open
+        except Exception as e:
+            st.error(f"Something went wrong while reading the file or running checks: {e}")
+
+# ---------------------- Results card (only after Run checks) ----------------------
+if st.session_state.calc_done and st.session_state.final_df is not None:
+    st.subheader("Results")
+
+    with st.container(border=True):
+        st.markdown(
+            """
+            <div style="font-size:1.05rem; font-weight:600; line-height:1.3;">
+                Local Prices Reporting DQ results
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Preview or download the analysed results")
+
+        # Two half-width buttons
+        col1, col2 = st.columns([1, 1], vertical_alignment="top")
+        with col1:
+            if st.button("👁️ View results", key="view_results_btn", use_container_width=True):
+                st.session_state.show_preview = True
+        with col2:
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=st.session_state.csv_bytes,
+                file_name="Analysed Local Prices DQ checks.csv",
+                mime="text/csv",
+                key="dq_download_btn",
+                use_container_width=True
+            )
+
+    # Inline preview that persists across reruns (only Status column coloured)
+    if st.session_state.show_preview:
+        with st.container(border=True):
+            st.markdown("**This table shows which columns in your Local Prices Reporting are valid. If data is invalid, the Status column lists the row numbers with incorrect formatting** (if less than 100 records).")
+            styled = style_results_table(st.session_state.final_df)
+            st.dataframe(
+                styled,
+                use_container_width=True,
+                height=560,
+                hide_index=True
+            )
+            st.button("Close preview", key="close_preview_btn", on_click=lambda: st.session_state.update(show_preview=False))
+
+else:
+    st.info("Please upload a CSV or Excel file and click Run checks.")
+
+
+# ---------------------- Important note (always visible at the bottom) ----------------------
+st.write('')
+st.write('')
+st.warning("**Please note that uploading and processing DQ checks through this tool does not constitute data submission. " \
+"This tool is solely intended to assess the formatting of your file.**")
+            `,
+"pages/3_About.py": `
+import streamlit as st
+
+st.title('About')
+st.write('This tool is aimed at supporting trusts to run DQ checks themselves for the following reports:')
+st.write('- Indicative Activity Plan (IAP) reporting')
+st.write('- Local Price reporting')
+st.write('')
+st.write('The reports specification can be found at:')
+st.write('- https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/')
+st.write('- https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/')
+st.write('')
+st.write('For any information on the process you can contact the **NHS England London Spec Comm BI team** at: england.dcmd.bilondon@nhs.net ')
+st.write('')
+st.warning("**Please note that uploading and processing DQ checks through this tool does not constitute data submission. " \
+"This tool is solely intended to assess the formatting of your file.**")
+            `,
+
+".streamlit/config.toml": `
+# This defines the colors of the webpage
+
+[theme]
+base="light"
+primaryColor="#0072CE"                     # e.g. colour for buttons and sliders
+backgroundColor="#ffffff"
+secondaryBackgroundColor="#e8eef9"                      # e.g. colour of sidebar
+textColor="#000000"
+font="Arial"
+            `,
+
+"input_data_other/london_logos_n_name.png": {
+url: "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/input_data_other/london_logos_n_name.png"
+},
+"reference_tables/Delegationservices_v38.csv": {
+  url: "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Delegationservices_v38.csv"
+},
+"reference_tables/HRG": {
+  url: "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv"
+},
+'reference_tables/NPOD': {
+  url: 'https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv'
+},
+"reference_tables/Service_Codes.csv": {
+  url: "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Service_Codes.csv"
+},
+"reference_tables/TFC.csv": {
+  url: "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv"
+},
+
+
+
+
+
+
+        },
+        },
+        document.getElementById("root")
+      );
+    </script>
+  </body>
+</html>
+
+
+
