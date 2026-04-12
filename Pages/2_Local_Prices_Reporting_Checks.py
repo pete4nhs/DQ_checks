@@ -143,7 +143,7 @@ def validate_activity_TFC_columns(df):
     #tfc = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\TFC.csv")
 
     # (Option B) when running in stlite version with github, use this URL version
-    tfc_URL = (    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
+    tfc_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
     tfc = pd.read_csv(tfc_URL)
       
     valid_codes = set(tfc.iloc[:, 0].dropna().astype(str))
@@ -197,7 +197,8 @@ def validate_commissioned_service_code_columns(df):
         return f"Error: '{col}' column not found in the data."
     invalid = df[df[col].isna()]
     invalid = pd.concat([invalid, df[df[col].astype(str).str.len() != 2]])
-    svc_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\Service_Codes.csv")
+    svc_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Service_Codes.csv")
+    svc_df = pd.read_csv(svc_URL)
     valid_codes = set(svc_df.iloc[:, 0].dropna().astype(str))
     df[col] = df[col].astype(str)
     invalid = df[~df[col].isin(valid_codes)]
@@ -210,7 +211,8 @@ def validate_service_code_columns(df):
         return f"Error: '{col}' column not found in the data."
     invalid = df[~df['TARIFF CODE'].isna()]
     invalid = invalid[invalid['TARIFF CODE'].astype(str).str.len() > 12]
-    del_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\Delegationservices_v38.csv")
+    del_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Service_Codes.csv")
+    del_df = pd.read_csv(del_URL)
     valid_codes = set(del_df.iloc[:, 0].dropna().astype(str))
     df[col] = df[col].astype(str)
     invalid = df[~df[col].isin(valid_codes)]
@@ -223,7 +225,8 @@ def validate_pod_code_columns(df):
         return f"Error: '{col}' column not found in the data."
     invalid = df[~df[col].isna()]
     invalid = invalid[invalid[col].astype(str).str.len() > 10]
-    npod = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables/NPOD.csv")
+    npod_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
+    npod = pd.read_csv(npod_URL)
     valid_codes = set(npod.iloc[:, 0].dropna().astype(str))
     df[col] = df[col].astype(str)
     invalid = df[~df[col].isin(valid_codes)]
@@ -288,9 +291,9 @@ def validate_tariff_code_columns(df):
     tariff = tariff_raw.astype(str).str.strip()
     has_tariff = tariff_raw.notna() & (tariff != "")
 
-    # Load HRG reference codes
-    hrg = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\HRG.csv")
-
+    hrg_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
+    hrg = pd.read_csv(hrg_URL)
+    
     # HRG column name can vary; handle both
     if 'HRG_code' in hrg.columns:
         hrg_col = 'HRG_code'
