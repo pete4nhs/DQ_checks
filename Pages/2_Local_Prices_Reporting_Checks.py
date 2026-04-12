@@ -138,8 +138,15 @@ def validate_activity_TFC_columns(df):
     for c in req_cols:
         if c not in df.columns:
             return f"Error: '{c}' column not found in the data."
-    tfc_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\TFC.csv")
-    valid_codes = set(tfc_df.iloc[:, 0].dropna().astype(str))
+    
+    # (Option A) when run locally use this
+    #tfc = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\TFC.csv")
+
+    # (Option B) when running in stlite version with github, use this URL version
+    tfc_URL = (    "https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
+    tfc = pd.read_csv(tfc_URL)
+      
+    valid_codes = set(tfc.iloc[:, 0].dropna().astype(str))
     df['ACTIVITY TREATMENT FUNCTION CODE'] = df['ACTIVITY TREATMENT FUNCTION CODE'].astype(str)
     allowed_pod_values = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER"}
     invalid = df[
