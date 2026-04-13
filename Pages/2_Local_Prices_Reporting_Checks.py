@@ -64,7 +64,7 @@ st.write('')
 st.write('The full documentation on how to fill in the report can be found at https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/.')
 # ---------------------- File upload (CSV only) ----------------------
 uploaded_lpr = st.file_uploader(
-    "📤 **Upload your CSV file**",
+    "📤 **Upload your Local Prices Reporting as a CSV file.**",
     type=["csv"],
     help="Upload your Local Prices Reporting here. Import only the essential tab as a '.csv' file.")
 
