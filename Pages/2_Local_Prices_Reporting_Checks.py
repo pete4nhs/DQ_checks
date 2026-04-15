@@ -112,10 +112,14 @@ def validate_year_columns(df):
 def validate_datetime_columns(df):
     col = 'DATE AND TIME DATA SET CREATED'
     if col not in df.columns:
-        return "Error: 'DATE AND TIME DATA SET CREATED' column not found in the data."
-    df[col] = df[col].astype(str)
-    pattern = r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'
-    invalid = df[~df[col].str.match(pattern, na=False)]
+        return f"Error: '{col}' column not found in the data."
+
+        df[col] = clean_numeric_text(df[col])
+    parsed = pd.to_datetime(df[col], errors="coerce")
+    invalid = df[
+        df[col].notna() & (
+            parsed.isna() |        # not a datetime at all
+            parsed.dt.second.isna())]  # seconds missing
     return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- ORGANISATION IDENTIFIER (CODE OF PROVIDER) (mandatory)
@@ -425,8 +429,7 @@ REQUIREMENT_MAP = {
     'LOCAL POINT OF DELIVERY CODE': 'optional',
     'LOCAL POINT OF DELIVERY DESCRIPTION': 'optional',
     'TARIFF CODE': 'mandatory where relevant',
-    'LOCAL PRICE': 'mandatory',
-}
+    'LOCAL PRICE': 'mandatory',}
 
 # ---------------------- STYLING (only Status column coloured) ----------------------
 def style_results_table(df: pd.DataFrame):
@@ -542,8 +545,7 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
                 Local Prices Reporting DQ results
             </div>
             """,
-            unsafe_allow_html=True,
-        )
+            unsafe_allow_html=True,)
         st.caption("Preview or download the analysed results")
 
         # Two half-width buttons
@@ -558,8 +560,7 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
                 file_name="Analysed Local Prices DQ checks.csv",
                 mime="text/csv",
                 key="dq_download_btn",
-                use_container_width=True
-            )
+                use_container_width=True)
 
     # Inline preview that persists across reruns (only Status column coloured)
     if st.session_state.show_preview:
@@ -570,8 +571,7 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
                 styled,
                 use_container_width=True,
                 height=560,
-                hide_index=True
-            )
+                hide_index=True)
             st.button("Close preview", key="close_preview_btn", on_click=lambda: st.session_state.update(show_preview=False))
 
 else:
