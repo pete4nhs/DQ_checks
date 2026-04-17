@@ -12,8 +12,7 @@ st.set_page_config(
     page_icon="https://www.england.nhs.uk/wp-content/themes/nhsengland/static/img/favicon.ico",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={"About": "This tool is designed to support ICBs/Trusts to check the data quality of their submission for Local Prices."},
-)
+    menu_items={"About": "This tool is designed to support ICBs/Trusts to check the data quality of their submission for Local Prices."},)
 
 # ---------------------- Session state initialisation ----------------------
 if "final_df" not in st.session_state:
@@ -103,8 +102,8 @@ def validate_year_columns(df):
     yr = pd.to_numeric(s, errors="coerce")
 
     invalid = df[
-        yr.isna() | (yr < 200000) | (yr > 209999)]
-
+        yr.isna() | (yr < 201011) | (yr > 205051)]
+    
     return list(invalid.index) if not invalid.empty else "Valid"
 
 
