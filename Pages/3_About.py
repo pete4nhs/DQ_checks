@@ -1,4 +1,4 @@
-#import streamlit as st
+import streamlit as st
 
 st.title('About')
 st.write('This tool is designed to support trusts in running their own data quality checks for the following reports:')
