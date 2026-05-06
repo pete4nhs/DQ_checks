@@ -113,7 +113,7 @@ def validate_datetime_columns(df):
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
 
-        df[col] = clean_numeric_text(df[col])
+    df[col] = clean_numeric_text(df[col])
     parsed = pd.to_datetime(df[col], errors="coerce")
     invalid = df[
         df[col].notna() & (
