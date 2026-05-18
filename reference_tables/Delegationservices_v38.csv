@@ -513,9 +513,3 @@ NCBPS22G,VETERANS’ MENTAL HEALTH COMPLEX TREATMENT SERVICE,0,NOT APPLICABLE,NO
 NCBPS05V,VETERANS’ PROSTHETIC SERVICE,0,RED,RED,RED,ACUTE
 NCBPSQ23,WOLFRAM SYNDROME SERVICE (ADULTS AND CHILDREN),0,RED,RED,RED,ACUTE
 NCBPS22W,WOMEN'S SECURE PATHWAY TRANSFORMATION,0,BLUE,BLUE,BLUE,MENTAL HEALTH
-,,,,,,
-ICB Delegation Status GREEN = Suitable and ready for delegation; AMBER = Suitable but not ready for delegation; RED = Retained by NHS England; BLUE = Denotes where funding is organised on a host provider basis in examples such as clinical network funding arrangements. The commissioner holding the budget for these service codes is subject to local contracting arrangements.,,,,,,
-,,,,,,
-Notes:,,,,,,
-"The above list shows all possible codes, some of which may have subsequently been retired. Users should refer to the effective from and to dates for their year(s) of applicability.",,,,,,
-,,,,,,
