@@ -1,9 +1,9 @@
-# cd "C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\"
+# cd "C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks"
 
 import streamlit as st
 import pandas as pd
 import io
-from datetime import datetime
+#from datetime import datetime
 #import os
 
 # ---------------------- Page config (must be first) ----------------------
@@ -25,6 +25,10 @@ if "show_preview" not in st.session_state:
     st.session_state.show_preview = False
 if "uploaded_signature" not in st.session_state:
     st.session_state.uploaded_signature = None  # to detect file changes
+if "show_instruction_msg" not in st.session_state:
+    st.session_state.show_instruction_msg = True
+if "upload_success" not in st.session_state:
+    st.session_state.upload_success = False
 
 
 # ---------------------- Helpers ----------------------
@@ -36,7 +40,7 @@ def file_signature(uploaded_file):
     return (uploaded_file.name, uploaded_file.size)
 
 
-def to_1_based_indices(result, limit=100):
+def to_1_based_indices(result, limit=1000):
     """
     Convert 0-based pandas indices to Excel-style row numbers:
     +1 for 1-based indexing, +1 for header row => +2 total.
@@ -47,7 +51,7 @@ def to_1_based_indices(result, limit=100):
     if isinstance(result, (list, tuple, pd.Index)):
         uniq = sorted(set(int(i) for i in result))
         rows = [i + 2 for i in uniq]
-        return f"More than {limit} invalid" if len(rows) > limit else rows
+        return f"More than {limit} invalid rows" if len(rows) > limit else rows
 
     if isinstance(result, pd.DataFrame):
         uniq = sorted(set(int(i) for i in result.index))
@@ -67,29 +71,293 @@ def clean_numeric_text(s: pd.Series) -> pd.Series:
          .str.replace(r"\.0+$", "", regex=True))  # strip trailing .0/.00...
 
 
+ALLOWED_COMMISSIONED_SERVICE_CATEGORY_CODES = {
+    "12", "21", "22", "25", "26","31", "32", "41",
+    "51", "55","61","71", "75","81", "85",
+    "91", "92", "93","98", "99",}
+
+NON_ACTIVITY_PODS = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER"}
+
+# Your extra exemption list goes here
+OTHER_BLANK_ALLOWED_PODS = set()
+
+BLANK_ALLOWED_PODS = NON_ACTIVITY_PODS.union(OTHER_BLANK_ALLOWED_PODS)
+
+def get_clean_and_blank(df, col):
+    cleaned = df[col].fillna("").astype("string").str.strip()
+    blank = cleaned.eq("")
+    return cleaned, blank
+
+def normalise_header(h: str) -> str:
+    """
+    Standardise a column name so that:
+    - Underscores are treated as spaces
+    - Case differences are removed (converted to uppercase)
+    - Hidden Excel characters are removed
+    - Extra spaces inside the string are NOT corrected (strict mode)
+    """
+    if h is None:
+        return ""
+
+    h = str(h)
+
+    # Remove hidden / problematic characters from Excel exports
+    h = (h.replace("\ufeff", "")   # BOM
+         .replace("\u00a0", " "))  # NBSP → normal space
+    
+    # Remove zero-width characters
+    h = re.sub(r"[\u200B-\u200D\uFEFF]", "", h)
+
+    # Trim leading/trailing spaces ONLY (keep internal spacing strict)
+    h = h.strip()
+
+    # Treat underscores as spaces
+    h = h.replace("_", " ")
+
+    # Convert to uppercase (final step)
+    h = h.upper()
+
+    return h
+
+
+
+def normalise_dataframe_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply header normalisation to the whole dataframe.
+    If two columns collapse to the same normalised name, keep the first and suffix the rest.
+    """
+    new_cols = []
+    seen = {}
+    for c in df.columns:
+        nc = normalise_header(c)
+        if nc in seen:
+            seen[nc] += 1
+            nc = f"{nc} ({seen[nc]})"
+        else:
+            seen[nc] = 0
+        new_cols.append(nc)
+
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
+def format_status_for_output(val):
+    """
+    Format the Status column for display.
+    - 'Valid' stays as-is
+    - Row lists become 'Invalid rows: [..]'
+    - 'More than X invalid' stays as-is (no prefix)
+    """
+    if isinstance(val, str):
+        v = val.strip()
+
+        if v == "Valid":
+            return "Valid"
+
+        # Do NOT prefix summary messages
+        if v.startswith("More than"):
+            return v
+
+        # Other strings (e.g. Error: column not found)
+        return v
+
+    # Only lists / indices get the prefix
+    if isinstance(val, (list, tuple, pd.Index)):
+        return f"Invalid rows: {list(val)}"
+
+    return val
+
+BLANK_WHEN_NON_ACTIVITY_POD_FIELDS = {
+    "ACTIVITY TREATMENT FUNCTION CODE"}
+
+BLANK_RULE_NOTE = (
+    "Leave this field blank when POINT OF DELIVERY CODE is "
+    "ADJUSTMENT, BLOCK, CQUIN, DRUG, DEVICE, or NAOTHER.")
+
+TARIFF_RULE_NOTE = (
+    "Leave this field blank when POINT OF DELIVERY CODE is "
+    "ADJUSTMENT, BLOCK, CQUIN, DRUG, DEVICE, NAOTHER, or OTHER. "
+    "For all other Point of Delivery Codes, a valid HRG‑based tariff code is required.")
+
+
+def non_activity_blank_rule_triggered(df: pd.DataFrame, field_col: str) -> bool:
+    """
+    Returns True only when:
+      - POD is a non-activity value, AND
+      - the field is populated (non-empty)
+    """
+    pod_col = "POINT OF DELIVERY CODE"
+    if field_col not in df.columns or pod_col not in df.columns:
+        return False
+
+    pod = (
+        df[pod_col]
+        .astype("string")
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.upper())
+
+    field_raw = df[field_col].astype("string")
+    field_has_value = field_raw.notna() & (field_raw.str.strip() != "")
+
+    return (field_has_value & pod.isin(NON_ACTIVITY_PODS)).any()
+
+
+
+def get_tariff_invalid_mask(df: pd.DataFrame) -> pd.Series | None:
+    col = "TARIFF CODE"
+    pod_col = "POINT OF DELIVERY CODE"
+
+    for c in (col, pod_col):
+        if c not in df.columns:
+            return None
+
+    exclude_pods = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER", "OTHER"}
+
+    pod_raw = df[pod_col]
+    pod = pod_raw.astype("string").str.strip().str.upper()
+    pod_known = pod_raw.notna() & (pod != "")
+
+    tariff_raw = df[col]
+    tariff = tariff_raw.astype("string").str.strip()
+
+    tariff_clean = (tariff
+        .str.replace("\ufeff", "", regex=False)
+        .str.replace("\xa0", " ", regex=False)
+        .str.strip())
+
+    tariff_up = tariff_clean.str.upper()
+    has_tariff = tariff_raw.notna() & (tariff_clean != "")
+
+    # when running locally
+#    hrg = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\HRG.csv")
+
+    # when running in stlite
+    hrg_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
+    hrg = pd.read_csv(hrg_URL)
+
+    if "HRG_code" in hrg.columns:
+        hrg_col = "HRG_code"
+    elif "HRG_Code" in hrg.columns:
+        hrg_col = "HRG_Code"
+    else:
+        hrg_col = hrg.columns[0]
+
+    valid_hrg = hrg[hrg_col].dropna().astype(str).str.strip().str.upper()
+
+    codes_by_len = {}
+    for code in valid_hrg:
+        codes_by_len.setdefault(len(code), set()).add(code)
+
+    starts_with_hrg = pd.Series(False, index=df.index)
+    for L, code_set in codes_by_len.items():
+        starts_with_hrg |= tariff_up.str[:L].isin(code_set)
+
+    invalid_too_long = has_tariff & (tariff_clean.str.len() > 50)
+
+    required = pod_known & (~pod.isin(exclude_pods))
+    invalid_missing_when_required = required & (~has_tariff)
+    invalid_bad_prefix_required = required & has_tariff & (~starts_with_hrg)
+
+    excluded = pod_known & pod.isin(exclude_pods)
+    invalid_bad_prefix_excluded = excluded & has_tariff & (~starts_with_hrg)
+
+    return (invalid_too_long
+        | invalid_missing_when_required
+        | invalid_bad_prefix_required
+        | invalid_bad_prefix_excluded)
+
+def tariff_rule_triggered(df: pd.DataFrame) -> bool:
+    invalid_mask = get_tariff_invalid_mask(df)
+    return False if invalid_mask is None else invalid_mask.any()
+
+
 
 # ---------------------- Header ----------------------
 st.image('input_data_other/london_logos_n_name.png', width=1050)
 st.title("Automated _Local Prices_ Reporting DQ checks")
 st.write('')
-st.write('The full documentation on how to fill in the report can be found at https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/.')
+st.write(
+    "The full documentation on how to fill in the report can be found at "
+    "[https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/]"
+    "(https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/)")
+
+
+# ---------------------- Instruction message ----------------------
+instruction_msg = st.empty()
+
+if st.session_state.show_instruction_msg:
+    instruction_msg.info("Please upload a CSV file and click 'Run checks'.")
+else:
+    instruction_msg.empty()
+
 # ---------------------- File upload (CSV only) ----------------------
 uploaded_lpr = st.file_uploader(
     "📤 **Upload your Local Prices Reporting as a CSV file.**",
     type=["csv"],
     help="Upload your Local Prices Reporting here. Import only the essential tab as a '.csv' file.")
 
-# If file changes, clear previous results so the UI doesn't show stale data
+# ---------------------- Reset state if file changes ----------------------
+
 sig = file_signature(uploaded_lpr)
-if sig != st.session_state.uploaded_signature:
-    st.session_state.uploaded_signature = sig
+
+# ---------------------- Handle upload / removal ----------------------
+
+# Case 1: file removed
+if uploaded_lpr is None:
+    st.session_state.uploaded_signature = None
+    st.session_state.upload_success = False
     st.session_state.final_df = None
     st.session_state.csv_bytes = None
     st.session_state.calc_done = False
     st.session_state.show_preview = False
+    if not st.session_state.calc_done:
+        st.session_state.show_instruction_msg = True
 
+# Case 2: new or changed file uploaded
+elif sig != st.session_state.uploaded_signature:
+    st.session_state.uploaded_signature = sig
+    st.session_state.upload_success = True
+    st.session_state.final_df = None
+    st.session_state.csv_bytes = None
+    st.session_state.calc_done = False
+    st.session_state.show_preview = False
+    st.session_state.show_instruction_msg = False
+# ---------------------- Upload message ----------------------
+
+if st.session_state.upload_success:
+    st.success("IAP CSV uploaded successfully!")
 
 # ---------------------- Validators  ----------------------
+
+
+
+
+
+
+
+#arrivato qua!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # --------------------- FINANCIAL YEAR (mandatory)
 def validate_year_columns(df):
@@ -156,26 +424,31 @@ def validate_commissioner_code_columns(df):
 
 # --------------------- ACTIVITY TREATMENT FUNCTION CODE (mandatory where relevant)
 def validate_activity_TFC_columns(df):
-    req_cols = ['ACTIVITY TREATMENT FUNCTION CODE', 'POINT OF DELIVERY CODE']
-    for c in req_cols:
+    col = 'ACTIVITY TREATMENT FUNCTION CODE'
+    pod_col = 'POINT OF DELIVERY CODE'
+
+    for c in (col, pod_col):
         if c not in df.columns:
             return f"Error: '{c}' column not found in the data."
-    
-    # (Option A) when run locally use this
-    #tfc = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\TFC.csv")
 
-    # (Option B) when running in stlite version with github, use this URL version
+    # when running locally
+#    tfc_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\TFC.csv")
+
+    # when running in stlite
     tfc_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
-    tfc = pd.read_csv(tfc_URL)
-      
-    valid_codes = set(tfc.iloc[:, 0].dropna().astype(str))
+    tfc_df = pd.read_csv(tfc_URL)    
+    
+    valid_codes = set(tfc_df.iloc[:, 0].dropna().astype(str).str.strip())
+    pod = df[pod_col].fillna("").astype("string").str.strip().str.upper()
+    cleaned, blank = get_clean_and_blank(df, col)
 
-    df['ACTIVITY TREATMENT FUNCTION CODE'] = df['ACTIVITY TREATMENT FUNCTION CODE'].astype(str)
-    allowed_pod_values = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER"}
-    invalid = df[
-        (~df['ACTIVITY TREATMENT FUNCTION CODE'].isin(valid_codes)) &
-        (~df['POINT OF DELIVERY CODE'].isin(allowed_pod_values))    ]
-    return  list(invalid.index) if not invalid.empty else "Valid"
+    invalid_when_pod_non_activity = pod.isin(NON_ACTIVITY_PODS) & (~blank)
+    invalid_required_missing = (~pod.isin(BLANK_ALLOWED_PODS)) & blank
+
+    invalid_code = (~blank) & (~cleaned.isin(valid_codes))
+
+    invalid = df[invalid_when_pod_non_activity | invalid_required_missing | invalid_code]
+    return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- LOCAL SUB-SPECIALTY CODE (optional)
 def validate_local_sub_columns(df):
@@ -215,22 +488,24 @@ def validate_nhs_service_cat_n_columns(df):
 
 # --------------------- COMMISSIONED SERVICE CATEGORY CODE (mandatory)
 def validate_commissioned_service_code_columns(df):
-    col = 'COMMISSIONED SERVICE CATEGORY CODE'
+    col = "COMMISSIONED SERVICE CATEGORY CODE"
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
-    invalid = df[df[col].isna()]
-    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() != 2]])
 
-        # (Option A) when run locally use this
-    #svc_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\Service_Codes.csv")
+    s = clean_numeric_text(df[col])
 
-    # (Option B) when running in stlite version with github, use this URL version
-    svc_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Service_Codes.csv")
-    svc_df = pd.read_csv(svc_URL)
- 
-    valid_codes = set(svc_df.iloc[:, 0].dropna().astype(str))
-    df[col] = df[col].astype(str)
-    invalid = df[~df[col].isin(valid_codes)]
+    # Mandatory: blank / NA is invalid
+    invalid_mask = s.isna() | (s == "")
+
+    # If present, must be exactly 2 digits (digits-only + length rule)
+    present = ~invalid_mask
+    invalid_mask |= present & ~s.str.fullmatch(r"\d{2}", na=False)
+
+    # If present and format OK, must be one of the allowed codes
+    format_ok = present & s.str.fullmatch(r"\d{2}", na=False)
+    invalid_mask |= format_ok & ~s.isin(ALLOWED_COMMISSIONED_SERVICE_CATEGORY_CODES)
+
+    invalid = df[invalid_mask]
     return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- SERVICE CODE (mandatory where relevant)
@@ -238,8 +513,6 @@ def validate_service_code_columns(df):
     col = 'SERVICE CODE'
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
-    invalid = df[~df['TARIFF CODE'].isna()]
-    invalid = invalid[invalid['TARIFF CODE'].astype(str).str.len() > 12]
 
     # (Option A) when run locally use this
     #del_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\Delegationservices_v38.csv")
@@ -312,74 +585,16 @@ def validate_local_pod_desc_columns(df):
     return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- TARIFF CODE (mandatory where relevant)
+
 def validate_tariff_code_columns(df):
-    col = 'TARIFF CODE'
-    pod_col = 'POINT OF DELIVERY CODE'
+    invalid_mask = get_tariff_invalid_mask(df)
 
-    # Ensure required columns exist
-    for c in (col, pod_col):
-        if c not in df.columns:
-            return f"Error: '{c}' column not found in the data."
-
-    # POD values where tariff code is NOT required (but allowed if <= 50 chars)
-    exclude_pods = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG", "DEVICE", "NAOTHER", "OTHER"}
-
-    pod_raw = df[pod_col]
-    pod = pod_raw.astype(str).str.strip().str.upper()
-    pod_known = pod_raw.notna() & (pod != "")
-
-    tariff_raw = df[col]
-    tariff = tariff_raw.astype(str).str.strip()
-    has_tariff = tariff_raw.notna() & (tariff != "")
-
-    # (Option A) when run locally use this
-    #hrg = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\HRG.csv")
-
-    # (Option B) when running in stlite version with github, use this URL version
-    hrg_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
-    hrg = pd.read_csv(hrg_URL)
-
-    # HRG column name can vary; handle both
-    if 'HRG_code' in hrg.columns:
-        hrg_col = 'HRG_code'
-    elif 'HRG_Code' in hrg.columns:
-        hrg_col = 'HRG_Code'
-    else:
-        # fallback: first column
-        hrg_col = hrg.columns[0]
-
-    valid_hrg = hrg[hrg_col].dropna().astype(str).str.strip().str.upper()
-
-    # Build lookup sets by HRG code length for efficient prefix checking
-    codes_by_len = {}
-    for code in valid_hrg:
-        codes_by_len.setdefault(len(code), set()).add(code)
-
-    tariff_up = tariff.str.upper()
-
-    # starts_with_hrg: True if tariff begins with any valid HRG code
-    starts_with_hrg = False
-    for L, code_set in codes_by_len.items():
-        prefix_ok = tariff_up.str[:L].isin(code_set)
-        starts_with_hrg = prefix_ok if starts_with_hrg is False else (starts_with_hrg | prefix_ok)
-
-    # Common length rule: if populated, must be <= 50
-    invalid_too_long = has_tariff & (tariff.str.len() > 50)
-
-    # Case A: POD is in exclude list => tariff may be blank OR populated (<=50)
-    # So: only invalid here is "too long" (handled above)
-
-    # Case B: POD is NOT in exclude list => tariff must be populated and valid
-    required = pod_known & (~pod.isin(exclude_pods))
-
-    invalid_missing_when_required = required & (~has_tariff)
-    invalid_bad_prefix_when_required = required & has_tariff & (~starts_with_hrg)
-
-    invalid_mask = invalid_too_long | invalid_missing_when_required | invalid_bad_prefix_when_required
+    if invalid_mask is None:
+        missing = [c for c in ["TARIFF CODE", "POINT OF DELIVERY CODE"] if c not in df.columns]
+        return f"Error: '{missing[0]}' column not found in the data."
 
     invalid_rows = df[invalid_mask]
     return list(invalid_rows.index) if not invalid_rows.empty else "Valid"
-
 
 # --------------------- LOCAL PRICE (mandatory)
 def validate_local_price_columns(df):
@@ -421,7 +636,7 @@ REQUIREMENT_MAP = {
     'PROVIDER REFERENCE IDENTIFIER': 'optional',
     'NHS SERVICE AGREEMENT LINE NUMBER': 'optional',
     'COMMISSIONED SERVICE CATEGORY CODE': 'mandatory',
-    'SERVICE CODE': 'mandatory where relevant',
+    'SERVICE CODE': 'mandatory',
     'POINT OF DELIVERY CODE': 'mandatory',
     'POINT OF DELIVERY FURTHER DETAIL CODE': 'mandatory where relevant',
     'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION': 'mandatory where relevant',
@@ -431,6 +646,7 @@ REQUIREMENT_MAP = {
     'LOCAL PRICE': 'mandatory',}
 
 # ---------------------- STYLING (only Status column coloured) ----------------------
+
 def style_results_table(df: pd.DataFrame):
     """
     Colour only the 'Status' column:
@@ -446,8 +662,6 @@ def style_results_table(df: pd.DataFrame):
         def is_invalid_or_empty(val):
             if isinstance(val, str):
                 return val.strip() != "Valid"
-            elif isinstance(val, (list, tuple, pd.Index)):
-                return len(val) > 0
             return True
 
         is_valid = isinstance(status, str) and status.strip() == "Valid"
@@ -466,21 +680,21 @@ def style_results_table(df: pd.DataFrame):
 if st.button("Run checks", type="primary"):
     if uploaded_lpr is None:
         st.warning("Please upload a CSV file before running checks.")
+        st.session_state.show_instruction_msg = True
     else:
         try:
             with st.spinner("Running calculations..."):
                 df = pd.read_csv(
                     uploaded_lpr,
-                    dtype={
-                        "FINANCIAL YEAR": "string",
-                        "DATE AND TIME DATA SET CREATED": "string",},
+                    dtype="string",         # read everything safely as string
                     encoding="utf-8-sig")
 
                 df = df.dropna(how="all").copy()
 
 
                 # Clean month/year values (before validation)
-                df["FINANCIAL YEAR"]  = clean_numeric_text(df["FINANCIAL YEAR"])
+                if "FINANCIAL YEAR" in df.columns:
+                    df["FINANCIAL YEAR"] = clean_numeric_text(df["FINANCIAL YEAR"])
 
                 # Build results
                 columns = pd.Series([
@@ -501,28 +715,45 @@ if st.button("Run checks", type="primary"):
                 requirement = columns.map(REQUIREMENT_MAP).rename("Field requirement")
 
                 status = pd.Series([
-                    to_1_based_indices(validate_year_columns(df)),
-                    to_1_based_indices(validate_datetime_columns(df)),
-                    to_1_based_indices(validate_cop_columns(df)),
-                    to_1_based_indices(validate_of_treatment_columns(df)),
-                    to_1_based_indices(validate_commissioner_code_columns(df)),
-                    to_1_based_indices(validate_activity_TFC_columns(df)),
-                    to_1_based_indices(validate_local_sub_columns(df)),
-                    to_1_based_indices(validate_comm_serial_n_columns(df)),
-                    to_1_based_indices(validate_provider_ref_identifier_columns(df)),
-                    to_1_based_indices(validate_nhs_service_cat_n_columns(df)),
-                    to_1_based_indices(validate_commissioned_service_code_columns(df)),
-                    to_1_based_indices(validate_service_code_columns(df)),
-                    to_1_based_indices(validate_pod_code_columns(df)),
-                    to_1_based_indices(validate_pod_further_detail_code_columns(df)),
-                    to_1_based_indices(validate_pod_further_detail_desc_columns(df)),
-                    to_1_based_indices(validate_local_pod_code_columns(df)),
-                    to_1_based_indices(validate_local_pod_desc_columns(df)),
-                    to_1_based_indices(validate_tariff_code_columns(df)),
-                    to_1_based_indices(validate_local_price_columns(df)),
+                    format_status_for_output(to_1_based_indices(validate_year_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_datetime_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_cop_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_of_treatment_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_commissioner_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_activity_TFC_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_local_sub_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_comm_serial_n_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_provider_ref_identifier_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_nhs_service_cat_n_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_commissioned_service_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_service_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_pod_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_pod_further_detail_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_pod_further_detail_desc_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_local_pod_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_local_pod_desc_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_tariff_code_columns(df))),
+                    format_status_for_output(to_1_based_indices(validate_local_price_columns(df))),
                 ], name="Status")
 
-                final_df = pd.concat([columns, requirement, status], axis=1)
+                notes = columns.map(
+                    lambda c: (
+                        BLANK_RULE_NOTE
+                        if (c in BLANK_WHEN_NON_ACTIVITY_POD_FIELDS
+                            and non_activity_blank_rule_triggered(df, c))
+
+                        else TARIFF_RULE_NOTE
+                        if (c == "TARIFF CODE"
+                            and tariff_rule_triggered(df))
+                        else "")).rename("Notes")
+
+                dfs = [columns, requirement, status]
+
+                # Only include Notes if at least one note is populated
+                if notes.str.strip().ne("").any():
+                    dfs.append(notes)
+
+                final_df = pd.concat(dfs, axis=1)
 
                 # Save for preview/download
                 csv = final_df.to_csv(index=False)
@@ -530,8 +761,10 @@ if st.button("Run checks", type="primary"):
                 st.session_state.final_df = final_df
                 st.session_state.calc_done = True
                 st.session_state.show_preview = False  # do not auto-open
+                st.session_state.show_instruction_msg = False
+                
         except Exception as e:
-            st.error(f"Something went wrong while reading the file or running checks: {e}")
+            st.error(f"Failed to read CSV file. {e}")
 
 # ---------------------- Results card (only after Run checks) ----------------------
 if st.session_state.calc_done and st.session_state.final_df is not None:
