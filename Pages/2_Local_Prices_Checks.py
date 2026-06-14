@@ -763,9 +763,6 @@ if st.button("Run checks", type="primary"):
                     if col in BLANK_WHEN_NON_ACTIVITY_POD_FIELDS and non_activity_blank_rule_triggered(df, col):
                         return BLANK_RULE_NOTE
 
-                    if col == "CONTRACT MONITORING PLANNED ACTIVITY" and non_activity_zero_rule_triggered(df, col):
-                        return CONTR_MON_PLAN_ACT_RULE_NOTE
-
                     if col == "TARIFF CODE" and tariff_rule_triggered(df):
                         return TARIFF_RULE_NOTE
 
@@ -834,9 +831,6 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
                 height=560,
                 hide_index=True)
             st.button("Close preview", key="close_preview_btn", on_click=lambda: st.session_state.update(show_preview=False))
-
-else:
-    st.info("Please upload a CSV or Excel file and click Run checks.")
 
 
 # ---------------------- Important note (always visible at the bottom) ----------------------
