@@ -2,7 +2,8 @@
 
 import streamlit as st
 import pandas as pd
-import io
+import re
+#import io
 #from datetime import datetime
 #import os
 
@@ -272,16 +273,61 @@ def tariff_rule_triggered(df: pd.DataFrame) -> bool:
     invalid_mask = get_tariff_invalid_mask(df)
     return False if invalid_mask is None else invalid_mask.any()
 
+# Length restriction suggestions
+
+LENGTH_RULES = {
+    "LOCAL SUB-SPECIALTY CODE": {"type": "max", "value": 8},
+    "LOCAL POINT OF DELIVERY CODE": {"type": "max", "value": 50},
+    "LOCAL POINT OF DELIVERY DESCRIPTION": {"type": "max", "value": 100},
+    "COMMISSIONING_SERIAL_NUMBER": {"type": "max", "value": 6},
+    "PROVIDER_REFERENCE_IDENTIFIER": {"type": "max", "value": 20},
+    "NHS_SERVICE_AGREEMENT_LINE_NUMBER": {"type": "max", "value": 10},
+    "LOCAL PRICE": {"type": "max", "value": 18}}
+
+def length_rule_triggered(df: pd.DataFrame, col: str) -> bool:
+    """
+    Returns True only when the field has an actual character-length issue.
+    This avoids showing a length note for unrelated problems such as a missing column.
+    """
+    if col not in df.columns or col not in LENGTH_RULES:
+        return False
+
+    rule = LENGTH_RULES[col]
+    s = df[col].astype("string")
+    present = s.notna()
+
+    if rule["type"] == "exact":
+        return (present & (s.str.len() != rule["value"])).any()
+
+    if rule["type"] == "max":
+        return (present & (s.str.len() > rule["value"])).any()
+
+    return False
+
+def get_length_rule_note(col: str) -> str:
+    """
+    Returns a friendly note describing the character length rule.
+    """
+    rule = LENGTH_RULES.get(col)
+    if not rule:
+        return ""
+
+    if rule["type"] == "exact":
+        return f"This field must be exactly {rule['value']} characters long."
+
+    if rule["type"] == "max":
+        return f"This field must be {rule['value']} characters or fewer."
+
+    return ""
 
 
 # ---------------------- Header ----------------------
 st.image('input_data_other/london_logos_n_name.png', width=1050)
 st.title("Automated _Local Prices_ Reporting DQ checks")
 st.write('')
-st.write(
-    "The full documentation on how to fill in the report can be found at "
-    "[https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/]"
-    "(https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/)")
+st.write("The full documentation on how to fill in the report can be found at "
+    "[https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/]"
+    "(https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/)")
 
 
 # ---------------------- Instruction message ----------------------
@@ -327,37 +373,9 @@ elif sig != st.session_state.uploaded_signature:
 # ---------------------- Upload message ----------------------
 
 if st.session_state.upload_success:
-    st.success("IAP CSV uploaded successfully!")
+    st.success("Local Price CSV uploaded successfully!")
 
 # ---------------------- Validators  ----------------------
-
-
-
-
-
-
-
-#arrivato qua!
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 # --------------------- FINANCIAL YEAR (mandatory)
 def validate_year_columns(df):
@@ -513,17 +531,22 @@ def validate_service_code_columns(df):
     col = 'SERVICE CODE'
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
+    
+    # when running in stlite
+    del_serv_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Delegationservices_v38.csv")
+    del_df = pd.read_csv(del_serv_URL)   
 
-    # (Option A) when run locally use this
-    #del_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables\Delegationservices_v38.csv")
+    # ✅ Make reference codes uppercase + trimmed
+    valid_codes = {str(v).strip().upper()
+        for v in del_df.iloc[:, 0].dropna()}
 
-    # (Option B) when running in stlite version with github, use this URL version
-    del_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Delegationservices_v38.csv")
-    del_df = pd.read_csv(del_URL)
+    # ✅ Clean + normalise user input the same way
+    s = df[col].astype("string").str.strip()
+    s_up = s.str.upper()
 
-    valid_codes = set(del_df.iloc[:, 0].dropna().astype(str))
-    df[col] = df[col].astype(str)
-    invalid = df[~df[col].isin(valid_codes)]
+    # ✅ Case-insensitive comparison
+    invalid = df[~s_up.isin(valid_codes)]
+
     return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- POINT OF DELIVERY CODE (mandatory)
@@ -736,22 +759,28 @@ if st.button("Run checks", type="primary"):
                     format_status_for_output(to_1_based_indices(validate_local_price_columns(df))),
                 ], name="Status")
 
-                notes = columns.map(
-                    lambda c: (
-                        BLANK_RULE_NOTE
-                        if (c in BLANK_WHEN_NON_ACTIVITY_POD_FIELDS
-                            and non_activity_blank_rule_triggered(df, c))
+                def build_note(df: pd.DataFrame, col: str) -> str:
+                    if col in BLANK_WHEN_NON_ACTIVITY_POD_FIELDS and non_activity_blank_rule_triggered(df, col):
+                        return BLANK_RULE_NOTE
 
-                        else TARIFF_RULE_NOTE
-                        if (c == "TARIFF CODE"
-                            and tariff_rule_triggered(df))
-                        else "")).rename("Notes")
+                    if col == "CONTRACT MONITORING PLANNED ACTIVITY" and non_activity_zero_rule_triggered(df, col):
+                        return CONTR_MON_PLAN_ACT_RULE_NOTE
+
+                    if col == "TARIFF CODE" and tariff_rule_triggered(df):
+                        return TARIFF_RULE_NOTE
+
+                    if col in LENGTH_RULES and length_rule_triggered(df, col):
+                        return get_length_rule_note(col)
+
+                    return ""
+
+                suggestions = columns.map(lambda c: build_note(df, c)).rename("Suggestions")
 
                 dfs = [columns, requirement, status]
 
-                # Only include Notes if at least one note is populated
-                if notes.str.strip().ne("").any():
-                    dfs.append(notes)
+                # Only include suggestions if at least one note is populated
+                if suggestions.str.strip().ne("").any():
+                    dfs.append(suggestions)
 
                 final_df = pd.concat(dfs, axis=1)
 
@@ -762,11 +791,11 @@ if st.button("Run checks", type="primary"):
                 st.session_state.calc_done = True
                 st.session_state.show_preview = False  # do not auto-open
                 st.session_state.show_instruction_msg = False
-                
+
         except Exception as e:
             st.error(f"Failed to read CSV file. {e}")
 
-# ---------------------- Results card (only after Run checks) ----------------------
+# ---------------------- Results  ----------------------
 if st.session_state.calc_done and st.session_state.final_df is not None:
     st.subheader("Results")
 
