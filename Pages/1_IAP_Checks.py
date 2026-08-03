@@ -435,7 +435,7 @@ def validate_month_columns(df):
         return f"Error: '{col}' column not found in the data."
     invalid = df[
         df[col].isna() |
-        (~pd.to_numeric(df[col], errors="coerce").between(1, 13))]
+        (~pd.to_numeric(df[col], errors="coerce").between(0, 13))]
 
     return list(invalid.index) if not invalid.empty else "Valid"
 
