@@ -554,19 +554,28 @@ def validate_pod_code_columns(df):
     col = 'POINT OF DELIVERY CODE'
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
-    invalid = df[~df[col].isna()]
-    invalid = invalid[invalid[col].astype(str).str.len() > 10]
 
-    # (Option A) when run locally use this
-    #npod = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating Local Prices checks\reference_tables/NPOD.csv")
+    NPOD_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
+    npod = pd.read_csv(NPOD_URL)
 
-    # (Option B) when running in stlite version with github, use this URL version
-    npod_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
-    npod = pd.read_csv(npod_URL)
+    # Clean and normalise NPOD reference values
+    valid_codes = set(
+        clean_numeric_text(npod.iloc[:, 0])
+        .str.upper()
+        .dropna())
     
-    valid_codes = set(npod.iloc[:, 0].dropna().astype(str))
-    df[col] = df[col].astype(str)
-    invalid = df[~df[col].isin(valid_codes)]
+    pod = (clean_numeric_text(df[col])
+        .str.upper())
+
+    # Validity check
+    invalid_mask = ~pod.isin(valid_codes)
+    
+    # Lenght rule validation
+    invalid_length = pod.notna() & (pod.str.len() > 10)
+
+    # In valid rows
+    invalid = df[invalid_mask | invalid_length]
+
     return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- POINT OF DELIVERY FURTHER DETAIL CODE (mandatory where relevant)
