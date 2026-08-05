@@ -242,10 +242,6 @@ def get_tariff_invalid_mask(df: pd.DataFrame) -> pd.Series | None:
     tariff_up = tariff_clean.str.upper()
     has_tariff = tariff_raw.notna() & (tariff_clean != "")
 
-    # when running locally
-#    hrg = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\HRG.csv")
-
-    # when running in stlite
     hrg_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
     hrg = pd.read_csv(hrg_URL)
 
@@ -513,11 +509,6 @@ def validate_gp_practice_columns(df):
         if c not in df.columns:
             return f"Error: '{c}' column not found in the data."
 
-    # Load ICB reference
-    # when running locally
-#    ref_org = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\ICB_and_SubICB_Apr2026.csv")
-
-#    # when running in stlite
     ref_org_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/ICB_and_SubICB_Apr2026.csv")
     ref_org = pd.read_csv(ref_org_URL)
 
@@ -547,11 +538,6 @@ def validate_residence_resp_columns(df):
         if c not in df.columns:
             return f"Error: '{c}' column not found in the data."
 
-    # Load ICB reference
-    # when running locally
-#    ref_org = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\ICB_and_SubICB_Apr2026.csv")
-
-#    # when running in stlite
     ref_org_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/ICB_and_SubICB_Apr2026.csv")
     ref_org = pd.read_csv(ref_org_URL)
 
@@ -601,10 +587,6 @@ def validate_activity_TFC_columns(df):
         if c not in df.columns:
             return f"Error: '{c}' column not found in the data."
 
-    # when running locally
-#    tfc_df = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\TFC.csv")
-
-    # when running in stlite
     tfc_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
     tfc_df = pd.read_csv(tfc_URL)    
     
@@ -676,7 +658,6 @@ def validate_service_code_columns(df):
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
     
-    # when running in stlite
     del_serv_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/Delegationservices_v38.csv")
     del_df = pd.read_csv(del_serv_URL)   
 
@@ -712,10 +693,6 @@ def validate_pod_code_columns(df):
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
 
-    # when running locally
-    # npod = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\NPOD.csv")
-
-    # when running in stlite
     NPOD_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
     npod = pd.read_csv(NPOD_URL)
 
