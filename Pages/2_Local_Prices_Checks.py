@@ -1,21 +1,23 @@
-# cd "C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks"
+# cd "C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\"
 
 import streamlit as st
 import pandas as pd
 import re
-#import io
-#from datetime import datetime
-#import os
 
 # ---------------------- Page config (must be first) ----------------------
+
 st.set_page_config(
-    page_title="Local Prices Reporting DQ checks",
+    page_title="IAP DQ checks",
     page_icon="https://www.england.nhs.uk/wp-content/themes/nhsengland/static/img/favicon.ico",
     layout="wide",
     initial_sidebar_state="expanded",
-    menu_items={"About": "This tool is designed to support ICBs/Trusts to check the data quality of their submission for Local Prices."},)
+    menu_items={
+        "About": (
+            "This tool is designed to support ICBs/Trusts to check the data quality "
+            "of their submission for Indicative Activity Plans (IAP).")},)
 
 # ---------------------- Session state initialisation ----------------------
+
 if "final_df" not in st.session_state:
     st.session_state.final_df = None
 if "csv_bytes" not in st.session_state:
@@ -39,28 +41,6 @@ def file_signature(uploaded_file):
     if uploaded_file is None:
         return None
     return (uploaded_file.name, uploaded_file.size)
-
-
-def to_1_based_indices(result, limit=1000):
-    """
-    Convert 0-based pandas indices to Excel-style row numbers:
-    +1 for 1-based indexing, +1 for header row => +2 total.
-    """
-    if isinstance(result, str):
-        return result
-
-    if isinstance(result, (list, tuple, pd.Index)):
-        uniq = sorted(set(int(i) for i in result))
-        rows = [i + 2 for i in uniq]
-        return f"More than {limit} invalid rows" if len(rows) > limit else rows
-
-    if isinstance(result, pd.DataFrame):
-        uniq = sorted(set(int(i) for i in result.index))
-        rows = [i + 2 for i in uniq]
-        return f"More than {limit} invalid" if len(rows) > limit else rows
-
-    return "Unexpected error"
-
 
 def clean_numeric_text(s: pd.Series) -> pd.Series:
     return (
@@ -143,33 +123,285 @@ def normalise_dataframe_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def format_status_for_output(val):
+def normalise_invalid_value_for_status(val):
     """
-    Format the Status column for display.
-    - 'Valid' stays as-is
-    - Row lists become 'Invalid rows: [..]'
-    - 'More than X invalid' stays as-is (no prefix)
+    Converts invalid values into a readable form for the Status column.
+    Blank or missing values are shown clearly as '(blank)'.
     """
-    if isinstance(val, str):
-        v = val.strip()
+    if pd.isna(val):
+        return "(blank)"
 
-        if v == "Valid":
-            return "Valid"
+    val = str(val).strip()
 
-        # Do NOT prefix summary messages
-        if v.startswith("More than"):
-            return v
-
-        # Other strings (e.g. Error: column not found)
-        return v
-
-    # Only lists / indices get the prefix
-    if isinstance(val, (list, tuple, pd.Index)):
-        return f"Invalid rows: {list(val)}"
+    if val == "":
+        return "(blank)"
 
     return val
 
+
+def get_invalid_indices(result):
+    """
+    Extracts the raw 0-based dataframe indices returned by the validator functions.
+    """
+    if isinstance(result, str):
+        return []
+
+    if isinstance(result, pd.DataFrame):
+        return list(result.index)
+
+    if isinstance(result, pd.Index):
+        return list(result)
+
+    if isinstance(result, (list, tuple)):
+        return list(result)
+
+    return []
+
+
+def get_status_indices_after_suppressing_rule_values(
+    df: pd.DataFrame,
+    col: str,
+    invalid_indices):
+    """
+    Suppresses values from the Status list where the value itself is technically
+    valid, but fails only because of a contextual POD rule.
+
+    Returns:
+      - indices to still show in Status
+      - count of rows suppressed because the field should be blank
+      - count of rows suppressed because the field should be zero
+    """
+    if len(invalid_indices) == 0:
+        return invalid_indices, 0, 0
+
+    pod_col = "POINT OF DELIVERY CODE"
+
+    if col not in df.columns or pod_col not in df.columns:
+        return invalid_indices, 0, 0
+
+    idx = pd.Index(invalid_indices)
+
+    pod = (
+        df.loc[idx, pod_col]
+        .astype("string")
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.upper())
+
+    value = df.loc[idx, col].astype("string").str.strip()
+    has_value = value.notna() & (value != "")
+
+    suppress_from_status = pd.Series(False, index=idx)
+    suppressed_blank_count = 0
+    suppressed_zero_count = 0
+
+    # ------------------------------------------------------------
+    # Rule 1: Fields that should be blank for non-activity PODs
+    # ------------------------------------------------------------
+    if col in BLANK_WHEN_NON_ACTIVITY_POD_FIELDS:
+        blank_rule_issue = pod.isin(NON_ACTIVITY_PODS) & has_value
+
+        otherwise_valid = pd.Series(False, index=idx)
+
+        if col == "ORGANISATION SITE IDENTIFIER (OF TREATMENT)":
+            otherwise_valid = has_value & value.str.len().between(5, 9)
+
+        elif col in {
+            "ORGANISATION IDENTIFIER (GP PRACTICE RESPONSIBILITY)",
+            "ORGANISATION IDENTIFIER (RESIDENCE RESPONSIBILITY)"}:
+            ref_org_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/ICB_and_SubICB_Apr2026.csv")
+            ref_org = pd.read_csv(ref_org_URL)
+
+            icb_codes = ref_org["ICB_Code"].dropna().astype(str).str.strip()
+            org_codes = ref_org["Organisation_Code"].dropna().astype(str).str.strip()
+            valid_codes = set(icb_codes).union(set(org_codes))
+
+            otherwise_valid = has_value & value.isin(valid_codes)
+
+        elif col == "ACTIVITY TREATMENT FUNCTION CODE":
+            tfc_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/TFC.csv")
+            tfc_df = pd.read_csv(tfc_URL)
+
+            valid_codes = set(
+                tfc_df.iloc[:, 0]
+                .dropna()
+                .astype(str)
+                .str.strip())
+
+            otherwise_valid = has_value & value.isin(valid_codes)
+
+        suppress_blank = blank_rule_issue & otherwise_valid
+        suppress_from_status |= suppress_blank
+        suppressed_blank_count += int(suppress_blank.sum())
+
+    # ------------------------------------------------------------
+    # Rule 2: TARIFF CODE should be blank for excluded PODs
+    # ------------------------------------------------------------
+    if col == "TARIFF CODE":
+        exclude_pods = {"ADJUSTMENT", "BLOCK", "CQUIN", "DRUG","DEVICE", "NAOTHER", "OTHER"}
+
+        blank_rule_issue = pod.isin(exclude_pods) & has_value
+
+        hrg_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/HRG.csv")
+        hrg = pd.read_csv(hrg_URL)
+
+        if "HRG_code" in hrg.columns:
+            hrg_col = "HRG_code"
+        elif "HRG_Code" in hrg.columns:
+            hrg_col = "HRG_Code"
+        else:
+            hrg_col = hrg.columns[0]
+
+        valid_hrg = (
+            hrg[hrg_col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.upper())
+
+        tariff_clean = (
+            value
+            .str.replace("\ufeff", "", regex=False)
+            .str.replace("\xa0", " ", regex=False)
+            .str.strip())
+
+        tariff_up = tariff_clean.str.upper()
+
+        codes_by_len = {}
+        for code in valid_hrg:
+            codes_by_len.setdefault(len(code), set()).add(code)
+
+        starts_with_hrg = pd.Series(False, index=idx)
+        for L, code_set in codes_by_len.items():
+            starts_with_hrg |= tariff_up.str[:L].isin(code_set)
+
+        otherwise_valid = (
+            has_value
+            & starts_with_hrg
+            & (tariff_clean.str.len() <= 50))
+
+        suppress_blank = blank_rule_issue & otherwise_valid
+        suppress_from_status |= suppress_blank
+        suppressed_blank_count += int(suppress_blank.sum())
+
+    # ------------------------------------------------------------
+    # Rule 3: CONTRACT MONITORING PLANNED ACTIVITY should be zero
+    # ------------------------------------------------------------
+    if col == "CONTRACT MONITORING PLANNED ACTIVITY":
+        raw_pod = df.loc[idx, pod_col].astype("string")
+
+        pod_unknown = (
+            raw_pod.isna()
+            | pod.isin({
+                "", "N/A", "#N/A", "NA", "#NA",
+                "NOT KNOWN", "UNKNOWN", "NOT APPLICABLE", "NONE", "NULL"}))
+
+        must_be_zero = pod.isin(NON_ACTIVITY_PODS) | pod_unknown
+
+        act_str = value
+        has_act_value = has_value
+        act_num = pd.to_numeric(act_str.where(has_act_value), errors="coerce")
+
+        pattern_ok = act_str.where(has_act_value).str.fullmatch(r"\d+(\.\d{1,3})?")
+        int_part_len = act_str.where(has_act_value).str.split(".", n=1).str[0].str.len()
+
+        structurally_valid_activity = (
+            has_act_value
+            & act_num.notna()
+            & pattern_ok.fillna(False)
+            & (int_part_len <= 10)
+            & (act_num >= 0))
+
+        zero_rule_issue = (
+            must_be_zero
+            & (
+                (~has_act_value)
+                | structurally_valid_activity)
+            & (act_num.fillna(-999999) != 0))
+
+        suppress_zero = zero_rule_issue
+        suppress_from_status |= suppress_zero
+        suppressed_zero_count += int(suppress_zero.sum())
+
+    indices_to_show = list(idx[~suppress_from_status])
+
+    return indices_to_show, suppressed_blank_count, suppressed_zero_count
+
+def build_status_with_invalid_values(df: pd.DataFrame, col: str, result, limit=100):
+    """
+    Builds the Status column.
+
+    Returns:
+      - 'Valid' if the check passed
+      - error message if the validator returned an error
+      - 'Invalid rows contain: [...]' with distinct invalid values shown once
+
+    Contextual rule handling:
+      - technically valid values that should be blank are counted, not listed
+      - structurally valid activity values that should be zero are counted, not listed
+      - genuinely invalid values are still listed
+    """
+    if isinstance(result, str):
+        return result
+
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+
+    invalid_indices = get_invalid_indices(result)
+
+    if len(invalid_indices) == 0:
+        return "Valid"
+
+    invalid_indices_for_status, blank_count, zero_count = (
+        get_status_indices_after_suppressing_rule_values(
+            df=df,
+            col=col,
+            invalid_indices=invalid_indices))
+
+    messages = []
+
+    # Case where there are genuinely invalid values to list
+    if len(invalid_indices_for_status) > 0:
+        invalid_values = (
+            df.loc[invalid_indices_for_status, col]
+            .map(normalise_invalid_value_for_status)
+            .tolist())
+
+        # Keep each invalid value once, preserving first-seen order
+        unique_values = list(dict.fromkeys(invalid_values))
+
+        if len(unique_values) > limit:
+            visible_values = unique_values[:limit]
+            messages.append(
+                f"Invalid rows contain: {visible_values} "
+                f"plus {len(unique_values) - limit} more unique invalid value(s)")
+        else:
+            messages.append(f"Invalid rows contain: {unique_values}")
+
+    # Add contextual counts
+    if blank_count > 0:
+        messages.append(
+            f"{blank_count} row(s) should be blank, see Suggestions")
+
+    if zero_count > 0:
+        messages.append(
+            f"{zero_count} row(s) should be 0, see Suggestions")
+
+    # Case where everything was suppressed into contextual counts
+    if len(messages) == 0:
+        return "Invalid"
+
+    if len(invalid_indices_for_status) == 0:
+        return "Invalid (" + "; ".join(messages) + ")"
+
+    return ". Also ".join(messages)
+
+
+
 BLANK_WHEN_NON_ACTIVITY_POD_FIELDS = {
+    "ORGANISATION SITE IDENTIFIER (OF TREATMENT)",
+    "ORGANISATION IDENTIFIER (GP PRACTICE RESPONSIBILITY)",
+    "ORGANISATION IDENTIFIER (RESIDENCE RESPONSIBILITY)",
     "ACTIVITY TREATMENT FUNCTION CODE"}
 
 BLANK_RULE_NOTE = (
@@ -180,6 +412,10 @@ TARIFF_RULE_NOTE = (
     "Leave this field blank when POINT OF DELIVERY CODE is "
     "ADJUSTMENT, BLOCK, CQUIN, DRUG, DEVICE, NAOTHER, or OTHER. "
     "For all other Point of Delivery Codes, a valid HRG‑based tariff code is required.")
+
+CONTR_MON_PLAN_ACT_RULE_NOTE = (
+    "This field must be set to 0 when POINT OF DELIVERY CODE is "
+    "ADJUSTMENT, BLOCK, CQUIN, DRUG, DEVICE, or NAOTHER")
 
 
 def non_activity_blank_rule_triggered(df: pd.DataFrame, field_col: str) -> bool:
@@ -203,7 +439,6 @@ def non_activity_blank_rule_triggered(df: pd.DataFrame, field_col: str) -> bool:
     field_has_value = field_raw.notna() & (field_raw.str.strip() != "")
 
     return (field_has_value & pod.isin(NON_ACTIVITY_PODS)).any()
-
 
 
 def get_tariff_invalid_mask(df: pd.DataFrame) -> pd.Series | None:
@@ -273,16 +508,51 @@ def tariff_rule_triggered(df: pd.DataFrame) -> bool:
     invalid_mask = get_tariff_invalid_mask(df)
     return False if invalid_mask is None else invalid_mask.any()
 
-# Length restriction suggestions
+def non_activity_zero_rule_triggered(df: pd.DataFrame, field_col: str) -> bool:
+    """
+    Returns True only when:
+      - POD is a non-activity value, AND
+      - the field is missing, non-numeric, or not equal to zero
+    """
+    pod_col = "POINT OF DELIVERY CODE"
+
+    if field_col not in df.columns or pod_col not in df.columns:
+        return False
+
+    pod = (df[pod_col]
+        .astype("string")
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.upper())
+
+    raw = df[field_col].astype("string")
+    val = raw.str.strip()
+
+    has_value = raw.notna() & (val != "")
+    act_num = pd.to_numeric(val.where(has_value), errors="coerce")
+
+    must_be_zero = pod.isin(NON_ACTIVITY_PODS)
+
+    return (must_be_zero & (
+            (~has_value) |
+            act_num.isna() |
+            (act_num != 0))).any()
+
+
+# ---------------------- Length restriction suggestions ----------------------
 
 LENGTH_RULES = {
+    "GENERAL MEDICAL PRACTICE (PATIENT REGISTRATION)": {"type": "exact", "value": 6},
     "LOCAL SUB-SPECIALTY CODE": {"type": "max", "value": 8},
+    "WARD CODE": {"type": "max", "value": 12},
     "LOCAL POINT OF DELIVERY CODE": {"type": "max", "value": 50},
     "LOCAL POINT OF DELIVERY DESCRIPTION": {"type": "max", "value": 100},
-    "COMMISSIONING_SERIAL_NUMBER": {"type": "max", "value": 6},
-    "PROVIDER_REFERENCE_IDENTIFIER": {"type": "max", "value": 20},
-    "NHS_SERVICE_AGREEMENT_LINE_NUMBER": {"type": "max", "value": 10},
-    "LOCAL PRICE": {"type": "max", "value": 18}}
+    "LOCAL CONTRACT CODE": {"type": "max", "value": 20},
+    "LOCAL CONTRACT CODE DESCRIPTION": {"type": "max", "value": 100},
+    "LOCAL CONTRACT MONITORING CODE": {"type": "max", "value": 30},
+    "LOCAL CONTRACT MONITORING DESCRIPTION": {"type": "max", "value": 100},
+    "CONTRACT MONITORING ADDITIONAL DETAIL": {"type": "max", "value": 50},
+    "CONTRACT MONITORING ADDITIONAL DESCRIPTION": {"type": "max", "value": 100},}
 
 def length_rule_triggered(df: pd.DataFrame, col: str) -> bool:
     """
@@ -321,13 +591,16 @@ def get_length_rule_note(col: str) -> str:
     return ""
 
 
+
 # ---------------------- Header ----------------------
-st.image('input_data_other/london_logos_n_name.png', width=1050)
-st.title("Automated _Local Prices_ Reporting DQ checks")
-st.write('')
-st.write("The full documentation on how to fill in the report can be found at "
-    "[https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/]"
-    "(https://www.england.nhs.uk/publication/local-prices-reporting-specification-technical-detail-specific-data-requirements/)")
+
+st.image("input_data_other/london_logos_n_name.png", width=1050)
+st.title("Automated _Indicative Activity Plans (IAP)_ Reporting DQ checks")
+st.write("")
+st.write(
+    "The full documentation on how to fill in the report can be found at "
+    "[https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/]"
+    "(https://www.england.nhs.uk/publication/iap-reporting-specification-technical-detail-specific-data-requirements/)")
 
 
 # ---------------------- Instruction message ----------------------
@@ -339,10 +612,11 @@ else:
     instruction_msg.empty()
 
 # ---------------------- File upload (CSV only) ----------------------
+
 uploaded_lpr = st.file_uploader(
-    "📤 **Upload your Local Prices Reporting as a CSV file.**",
+    "📤 **Upload your IAP as a CSV file.**",
     type=["csv"],
-    help="Upload your Local Prices Reporting here. Import only the essential tab as a '.csv' file.")
+    help="Upload your IAP here. Import only the essential tab as a '.csv' file.",)
 
 # ---------------------- Reset state if file changes ----------------------
 
@@ -370,12 +644,24 @@ elif sig != st.session_state.uploaded_signature:
     st.session_state.calc_done = False
     st.session_state.show_preview = False
     st.session_state.show_instruction_msg = False
+
 # ---------------------- Upload message ----------------------
 
 if st.session_state.upload_success:
-    st.success("Local Price CSV uploaded successfully!")
+    st.success("IAP CSV uploaded successfully!")
+# ---------------------- Validators ----------------------
 
-# ---------------------- Validators  ----------------------
+# --------------------- FINANCIAL MONTH (mandatory)
+def validate_month_columns(df):
+    col = 'FINANCIAL MONTH'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].isna() |
+        (~pd.to_numeric(df[col], errors="coerce").between(0, 13))]
+
+    return list(invalid.index) if not invalid.empty else "Valid"
+
 
 # --------------------- FINANCIAL YEAR (mandatory)
 def validate_year_columns(df):
@@ -389,7 +675,7 @@ def validate_year_columns(df):
 
     invalid = df[
         yr.isna() | (yr < 201011) | (yr > 205051)]
-    
+
     return list(invalid.index) if not invalid.empty else "Valid"
 
 
@@ -423,12 +709,91 @@ def validate_cop_columns(df):
 # --------------------- ORGANISATION SITE IDENTIFIER (OF TREATMENT) (mandatory where relevant)
 def validate_of_treatment_columns(df):
     col = 'ORGANISATION SITE IDENTIFIER (OF TREATMENT)'
-    if col not in df.columns:
-        return f"Error: '{col}' column not found in the data."
-    invalid = df[~df[col].isna()]
-    invalid = invalid[invalid[col].astype(str).str.len() < 5]
-    invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 9]])
+    pod_col = 'POINT OF DELIVERY CODE'
+
+    for c in (col, pod_col):
+        if c not in df.columns:
+            return f"Error: '{c}' column not found in the data."
+
+    pod = df[pod_col].fillna("").astype("string").str.strip().str.upper()
+    cleaned, blank = get_clean_and_blank(df, col)
+
+    invalid_when_pod_non_activity = pod.isin(NON_ACTIVITY_PODS) & (~blank)
+    invalid_required_missing = (~pod.isin(BLANK_ALLOWED_PODS)) & blank
+
+    invalid_length = (~blank) & ((cleaned.str.len() < 5) | (cleaned.str.len() > 9))
+
+    invalid = df[invalid_when_pod_non_activity | invalid_required_missing | invalid_length]
     return list(invalid.index) if not invalid.empty else "Valid"
+
+
+# --------------------- ORGANISATION IDENTIFIER (GP PRACTICE RESPONSIBILITY) (optional - but treat as mandatory where relevant!)
+def validate_gp_practice_columns(df):
+    col = 'ORGANISATION IDENTIFIER (GP PRACTICE RESPONSIBILITY)'
+    pod_col = 'POINT OF DELIVERY CODE'
+
+    for c in (col, pod_col):
+        if c not in df.columns:
+            return f"Error: '{c}' column not found in the data."
+
+    # Load ICB reference
+    # when running locally
+#    ref_org = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\ICB_and_SubICB_Apr2026.csv")
+
+#    # when running in stlite
+    ref_org_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/ICB_and_SubICB_Apr2026.csv")
+    ref_org = pd.read_csv(ref_org_URL)
+
+    # ✅ Decide which codes are valid
+    icb_codes = ref_org['ICB_Code'].dropna().astype(str).str.strip()
+    org_codes = ref_org['Organisation_Code'].dropna().astype(str).str.strip()
+    valid_codes = set(icb_codes).union(set(org_codes))
+
+    pod = df[pod_col].fillna("").astype("string").str.strip().str.upper()
+    cleaned, blank = get_clean_and_blank(df, col)
+
+    invalid_when_pod_non_activity = pod.isin(NON_ACTIVITY_PODS) & (~blank)
+    invalid_required_missing = (~pod.isin(BLANK_ALLOWED_PODS)) & blank
+
+    invalid_code = (~blank) & (~cleaned.isin(valid_codes))
+
+    invalid = df[invalid_when_pod_non_activity | invalid_required_missing | invalid_code]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+
+# --------------------- ORGANISATION IDENTIFIER (RESIDENCE RESPONSIBILITY) (optional - but treat as mandatory where relevant!)
+def validate_residence_resp_columns(df):
+    col = 'ORGANISATION IDENTIFIER (RESIDENCE RESPONSIBILITY)'
+    pod_col = 'POINT OF DELIVERY CODE'
+
+    for c in (col, pod_col):
+        if c not in df.columns:
+            return f"Error: '{c}' column not found in the data."
+
+    # Load ICB reference
+    # when running locally
+#    ref_org = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\ICB_and_SubICB_Apr2026.csv")
+
+#    # when running in stlite
+    ref_org_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/ICB_and_SubICB_Apr2026.csv")
+    ref_org = pd.read_csv(ref_org_URL)
+
+    icb_codes = ref_org['ICB_Code'].dropna().astype(str).str.strip()
+    org_codes = ref_org['Organisation_Code'].dropna().astype(str).str.strip()
+    valid_codes = set(icb_codes).union(set(org_codes))
+
+    pod = df[pod_col].fillna("").astype("string").str.strip().str.upper()
+    cleaned, blank = get_clean_and_blank(df, col)
+
+    invalid_when_pod_non_activity = pod.isin(NON_ACTIVITY_PODS) & (~blank)
+    invalid_required_missing = (~pod.isin(BLANK_ALLOWED_PODS)) & blank
+
+    invalid_code = (~blank) & (~cleaned.isin(valid_codes))
+
+    invalid = df[invalid_when_pod_non_activity | invalid_required_missing | invalid_code]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+
 
 # --------------------- ORGANISATION IDENTIFIER (CODE OF COMMISSIONER) (mandatory)
 def validate_commissioner_code_columns(df):
@@ -438,6 +803,16 @@ def validate_commissioner_code_columns(df):
     invalid = df[df[col].isna()]
     invalid = pd.concat([invalid, df[df[col].astype(str).str.len() < 3]])
     invalid = pd.concat([invalid, df[df[col].astype(str).str.len() > 5]])
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- GENERAL MEDICAL PRACTICE (PATIENT REGISTRATION) (optional)
+def validate_patient_reg_columns(df):
+    col = 'GENERAL MEDICAL PRACTICE (PATIENT REGISTRATION)'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() != 6)]
     return list(invalid.index) if not invalid.empty else "Valid"
 
 # --------------------- ACTIVITY TREATMENT FUNCTION CODE (mandatory where relevant)
@@ -473,38 +848,29 @@ def validate_local_sub_columns(df):
     col = 'LOCAL SUB-SPECIALTY CODE'
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
-    invalid = df[~df[col].isna()]
-    invalid = invalid[invalid[col].astype(str).str.len() > 8]
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 8)]
     return list(invalid.index) if not invalid.empty else "Valid"
 
-# --------------------- COMMISSIONING SERIAL NUMBER (optional)
-def validate_comm_serial_n_columns(df):
-    col = 'COMMISSIONING SERIAL NUMBER'
-    if col not in df.columns:
-        return f"Error: '{col}' column not found in the data."
-    invalid = df[~df[col].isna()]
-    invalid = invalid[invalid[col].astype(str).str.len() > 6]
-    return list(invalid.index) if not invalid.empty else "Valid"
+# --------------------- WARD CODE (mandatory where relevant)
+def validate_ward_code_columns(df):
 
-# --------------------- PROVIDER REFERENCE IDENTIFIER (optional)
-def validate_provider_ref_identifier_columns(df):
-    col = 'PROVIDER REFERENCE IDENTIFIER'
-    if col not in df.columns:
-        return f"Error: '{col}' column not found in the data."
-    invalid = df[~df[col].isna()]
-    invalid = invalid[invalid[col].astype(str).str.len() > 20]
-    return list(invalid.index) if not invalid.empty else "Valid"
+    # Ensure that the column exists in the DataFrame
+    if 'WARD CODE' not in df.columns:
+        return "Error: 'WARD CODE' column not found in the data."
 
-# --------------------- NHS SERVICE AGREEMENT LINE NUMBER (optional)
-def validate_nhs_service_cat_n_columns(df):
-    col = 'NHS SERVICE AGREEMENT LINE NUMBER'
-    if col not in df.columns:
-        return f"Error: '{col}' column not found in the data."
-    invalid = df[~df[col].isna()]
-    invalid = invalid[invalid[col].astype(str).str.len() > 10]
-    return list(invalid.index) if not invalid.empty else "Valid"
+    # Validate the column values
+    invalid_rows = df[~df['WARD CODE'].isna()]
+    invalid_rows = invalid_rows[invalid_rows['WARD CODE'].astype(str).str.len() > 12]  
+
+    if not invalid_rows.empty:
+        return list(invalid_rows.index)
+    else:
+        return "Valid"
 
 # --------------------- COMMISSIONED SERVICE CATEGORY CODE (mandatory)
+
 def validate_commissioned_service_code_columns(df):
     col = "COMMISSIONED SERVICE CATEGORY CODE"
     if col not in df.columns:
@@ -525,6 +891,7 @@ def validate_commissioned_service_code_columns(df):
 
     invalid = df[invalid_mask]
     return list(invalid.index) if not invalid.empty else "Valid"
+
 
 # --------------------- SERVICE CODE (mandatory where relevant)
 def validate_service_code_columns(df):
@@ -549,12 +916,29 @@ def validate_service_code_columns(df):
 
     return list(invalid.index) if not invalid.empty else "Valid"
 
+# --------------------- SPECIALISED MENTAL HEALTH SERVICE CATEGORY CODE (mandatory where relevant)
+def validate_specialised_mental_health_code_columns(df):
+    col = 'SPECIALISED MENTAL HEALTH SERVICE CATEGORY CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+
+    invalid_rows = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 50)]
+    return list(invalid_rows.index) if not invalid_rows.empty else "Valid"
+
+
+
 # --------------------- POINT OF DELIVERY CODE (mandatory)
 def validate_pod_code_columns(df):
     col = 'POINT OF DELIVERY CODE'
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
 
+    # when running locally
+    # npod = pd.read_csv(r"C:\Users\peter.saiu\OneDrive - NHS\Scripts\Python\Automating_IAPs_&_Local_Prices_DQ_checks\reference_tables\NPOD.csv")
+
+    # when running in stlite
     NPOD_URL = ("https://raw.githubusercontent.com/pete4nhs/DQ_checks/main/reference_tables/NPOD.csv")
     npod = pd.read_csv(NPOD_URL)
 
@@ -587,6 +971,7 @@ def validate_pod_further_detail_code_columns(df):
         (df[col].astype(str).str.len() > 10)]
     return list(invalid.index) if not invalid.empty else "Valid"
 
+
 # --------------------- POINT OF DELIVERY FURTHER DETAIL DESCRIPTION (mandatory where relevant)
 def validate_pod_further_detail_desc_columns(df):
     col = 'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION'
@@ -616,6 +1001,67 @@ def validate_local_pod_desc_columns(df):
         (df[col].astype(str).str.len() > 100)]
     return list(invalid.index) if not invalid.empty else "Valid"
 
+# --------------------- LOCAL CONTRACT CODE (optional)
+def validate_local_contract_code_columns(df):
+    col = 'LOCAL CONTRACT CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 20)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+
+# --------------------- LOCAL CONTRACT CODE DESCRIPTION (optional)
+def validate_local_contract_code_desc_columns(df):
+    col = 'LOCAL CONTRACT CODE DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 100)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL CONTRACT MONITORING CODE (optional)
+def validate_local_contract_monitoring_code_columns(df):
+    col = 'LOCAL CONTRACT MONITORING CODE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 30)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- LOCAL CONTRACT MONITORING DESCRIPTION (optional)
+def validate_local_contract_monitoring_desc_columns(df):
+    col = 'LOCAL CONTRACT MONITORING DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 100)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- CONTRACT MONITORING ADDITIONAL DETAIL (optional)
+def validate_contract_monitoring_detail_columns(df):
+    col = 'CONTRACT MONITORING ADDITIONAL DETAIL'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 50)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- CONTRACT MONITORING ADDITIONAL DESCRIPTION (optional)
+def validate_contract_monitoring_desc_columns(df):
+    col = 'CONTRACT MONITORING ADDITIONAL DESCRIPTION'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 100)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
 # --------------------- TARIFF CODE (mandatory where relevant)
 
 def validate_tariff_code_columns(df):
@@ -628,54 +1074,145 @@ def validate_tariff_code_columns(df):
     invalid_rows = df[invalid_mask]
     return list(invalid_rows.index) if not invalid_rows.empty else "Valid"
 
-# --------------------- LOCAL PRICE (mandatory)
-def validate_local_price_columns(df):
-    col = 'LOCAL PRICE'
 
+
+# --------------------- TARIFF CODE INDICATOR (mandatory where relevant)
+def validate_tariff_indicator_columns(df):
+    col = 'NATIONAL TARIFF INDICATOR'
+
+    # Ensure the column exists
     if col not in df.columns:
         return f"Error: '{col}' column not found in the data."
 
-    series = df[col]
-    s = series.astype(str).str.strip()
+    # Optional field: empty is allowed; if populated, must be exactly one character: Y or N
+    invalid_rows = df[
+        df[col].notna() &
+        ((df[col].astype(str).str.len() != 1) |
+            (~df[col].astype(str).str.upper().isin(['Y', 'N'])))]
 
-    # Must not be empty
-    empty_invalid = series.isna() | (s == "")
+    return list(invalid_rows.index) if not invalid_rows.empty else "Valid"
 
-    # Must be a number (integer or decimal)
-    decimal_ok = s.str.fullmatch(r"\d+(\.\d+)?")
 
-    # Total digits (excluding decimal point) ≤ 18
-    digit_count_ok = s.str.replace(".", "", regex=False).str.len() <= 18
+# --------------------- CONTRACT MONITORING PLANNED ACTIVITY (optional)
 
-    numeric_invalid = ~(decimal_ok & digit_count_ok)
+def validate_contract_monitoring_activity_columns(df):
+    act_col = 'CONTRACT MONITORING PLANNED ACTIVITY'
+    pod_col = 'POINT OF DELIVERY CODE'
 
-    invalid_mask = empty_invalid | numeric_invalid
-    invalid_indices = list(series.index[invalid_mask])
+    for c in (act_col, pod_col):
+        if c not in df.columns:
+            return f"Error: '{c}' column not found in the data."
 
-    return "Valid" if not invalid_indices else invalid_indices
+    # Normalise POD values
+    raw_pod = df[pod_col].astype("string")
+    pod = (
+        raw_pod
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.upper())
 
+    pod_unknown = (
+        raw_pod.isna() |
+        pod.isin({
+            "", "N/A", "#N/A", "NA", "#NA",
+            "NOT KNOWN", "UNKNOWN", "NOT APPLICABLE", "NONE", "NULL"}))
+
+    # For these PODs, activity must be zero (not blank)
+    is_non_activity = pod.isin(NON_ACTIVITY_PODS)
+    must_be_zero = is_non_activity | pod_unknown
+
+    # Normalise activity
+    raw = df[act_col].astype("string")
+    act_str = raw.str.strip()
+
+    has_value = raw.notna() & (act_str != "")
+    act_num = pd.to_numeric(act_str.where(has_value), errors="coerce")
+
+    # Format rule (only when a value is provided)
+    pattern_ok = act_str.where(has_value).str.fullmatch(r"\d+(\.\d{1,3})?")
+    int_part_len = act_str.where(has_value).str.split(".", n=1).str[0].str.len()
+
+    format_invalid = has_value & (
+        act_num.isna() |
+        (~pattern_ok.fillna(False)) |
+        (int_part_len > 10) |
+        (act_num < 0))
+
+    # Zero rule:
+    # when POD is non‑activity or unknown, activity must be explicitly 0
+    zero_rule_invalid = (
+        must_be_zero & (
+            (~has_value) |
+            act_num.isna() |
+            (act_num != 0)))
+
+    invalid_rows = df[format_invalid | zero_rule_invalid]
+    return list(invalid_rows.index) if not invalid_rows.empty else "Valid"
+
+
+# --------------------- CONTRACT MONITORING PLANNED PRICE (mandatory where relevant)
+def validate_contract_monitoring_price_columns(df):
+    col = 'CONTRACT MONITORING PLANNED PRICE'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 18)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+
+# --------------------- CONTRACT MONITORING PLANNED MARKET FORCES FACTOR (mandatory where relevant)
+def validate_contract_monitoring_market_columns(df):
+    col = 'CONTRACT MONITORING PLANNED MARKET FORCES FACTOR'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].notna() &
+        (df[col].astype(str).str.len() > 18)]
+    return list(invalid.index) if not invalid.empty else "Valid"
+
+# --------------------- NAME OF SUBMITTER (mandatory)
+def validate_name_of_submitter_columns(df):
+    col = 'NAME OF SUBMITTER'
+    if col not in df.columns:
+        return f"Error: '{col}' column not found in the data."
+    invalid = df[
+        df[col].isna() |
+        (df[col].astype(str).str.len() > 100)]
+    return list(invalid.index) if not invalid.empty else "Valid"
 
 # ---------------------- FIELD REQUIREMENT MAP ----------------------
 REQUIREMENT_MAP = {
-    'FINANCIAL YEAR': 'mandatory',
+    'FINANCIAL MONTH': 'mandatory','FINANCIAL YEAR': 'mandatory',
     'DATE AND TIME DATA SET CREATED': 'mandatory',
     'ORGANISATION IDENTIFIER (CODE OF PROVIDER)': 'mandatory',
     'ORGANISATION SITE IDENTIFIER (OF TREATMENT)': 'mandatory where relevant',
+    'ORGANISATION IDENTIFIER (GP PRACTICE RESPONSIBILITY)': 'mandatory where relevant',
+    'ORGANISATION IDENTIFIER (RESIDENCE RESPONSIBILITY)': 'mandatory where relevant',
     'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)': 'mandatory',
+    'GENERAL MEDICAL PRACTICE (PATIENT REGISTRATION)': 'optional',
     'ACTIVITY TREATMENT FUNCTION CODE': 'mandatory where relevant',
     'LOCAL SUB-SPECIALTY CODE': 'optional',
-    'COMMISSIONING SERIAL NUMBER': 'optional',
-    'PROVIDER REFERENCE IDENTIFIER': 'optional',
-    'NHS SERVICE AGREEMENT LINE NUMBER': 'optional',
+    'WARD CODE': 'mandatory where relevant',
     'COMMISSIONED SERVICE CATEGORY CODE': 'mandatory',
     'SERVICE CODE': 'mandatory',
+    'SPECIALISED MENTAL HEALTH SERVICE CATEGORY CODE': 'mandatory where relevant',
     'POINT OF DELIVERY CODE': 'mandatory',
     'POINT OF DELIVERY FURTHER DETAIL CODE': 'mandatory where relevant',
     'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION': 'mandatory where relevant',
     'LOCAL POINT OF DELIVERY CODE': 'optional',
     'LOCAL POINT OF DELIVERY DESCRIPTION': 'optional',
+    'LOCAL CONTRACT CODE': 'optional',
+    'LOCAL CONTRACT CODE DESCRIPTION': 'optional',
+    'LOCAL CONTRACT MONITORING CODE': 'optional',
+    'LOCAL CONTRACT MONITORING DESCRIPTION': 'optional',
+    'CONTRACT MONITORING ADDITIONAL DETAIL': 'optional',
+    'CONTRACT MONITORING ADDITIONAL DESCRIPTION': 'optional',
     'TARIFF CODE': 'mandatory where relevant',
-    'LOCAL PRICE': 'mandatory',}
+    'NATIONAL TARIFF INDICATOR': 'mandatory where relevant', 'CONTRACT MONITORING PLANNED ACTIVITY': 'optional',
+    'CONTRACT MONITORING PLANNED PRICE': 'mandatory where relevant',
+    'CONTRACT MONITORING PLANNED MARKET FORCES FACTOR': 'mandatory where relevant',
+    'NAME OF SUBMITTER': 'mandatory'}
 
 # ---------------------- STYLING (only Status column coloured) ----------------------
 
@@ -709,6 +1246,7 @@ def style_results_table(df: pd.DataFrame):
 
 
 # ---------------------- Run checks button ----------------------
+
 if st.button("Run checks", type="primary"):
     if uploaded_lpr is None:
         st.warning("Please upload a CSV file before running checks.")
@@ -723,54 +1261,90 @@ if st.button("Run checks", type="primary"):
 
                 df = df.dropna(how="all").copy()
 
+                # Normalise headers so underscores/spaces/case differences don't matter
+                df = normalise_dataframe_headers(df)
 
                 # Clean month/year values (before validation)
+                if "FINANCIAL MONTH" in df.columns:
+                    df["FINANCIAL MONTH"] = clean_numeric_text(df["FINANCIAL MONTH"])
+
                 if "FINANCIAL YEAR" in df.columns:
                     df["FINANCIAL YEAR"] = clean_numeric_text(df["FINANCIAL YEAR"])
 
                 # Build results
                 columns = pd.Series([
-                    'FINANCIAL YEAR', 'DATE AND TIME DATA SET CREATED',
-                    'ORGANISATION IDENTIFIER (CODE OF PROVIDER)',
-                    'ORGANISATION SITE IDENTIFIER (OF TREATMENT)',
-                    'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)',
-                    'ACTIVITY TREATMENT FUNCTION CODE', 'LOCAL SUB-SPECIALTY CODE',
-                    'COMMISSIONING SERIAL NUMBER', 'PROVIDER REFERENCE IDENTIFIER',
-                    'NHS SERVICE AGREEMENT LINE NUMBER',
-                    'COMMISSIONED SERVICE CATEGORY CODE', 'SERVICE CODE',
-                    'POINT OF DELIVERY CODE', 'POINT OF DELIVERY FURTHER DETAIL CODE',
-                    'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION',
-                    'LOCAL POINT OF DELIVERY CODE', 'LOCAL POINT OF DELIVERY DESCRIPTION',
-                    'TARIFF CODE', 'LOCAL PRICE'
+                'FINANCIAL MONTH', 'FINANCIAL YEAR', 'DATE AND TIME DATA SET CREATED',
+                'ORGANISATION IDENTIFIER (CODE OF PROVIDER)',
+                'ORGANISATION SITE IDENTIFIER (OF TREATMENT)',
+                'ORGANISATION IDENTIFIER (GP PRACTICE RESPONSIBILITY)',
+                'ORGANISATION IDENTIFIER (RESIDENCE RESPONSIBILITY)',
+                'ORGANISATION IDENTIFIER (CODE OF COMMISSIONER)',
+                'GENERAL MEDICAL PRACTICE (PATIENT REGISTRATION)',
+                'ACTIVITY TREATMENT FUNCTION CODE', 'LOCAL SUB-SPECIALTY CODE',
+                'WARD CODE', 'COMMISSIONED SERVICE CATEGORY CODE', 'SERVICE CODE',
+                'SPECIALISED MENTAL HEALTH SERVICE CATEGORY CODE',
+                'POINT OF DELIVERY CODE', 'POINT OF DELIVERY FURTHER DETAIL CODE',
+                'POINT OF DELIVERY FURTHER DETAIL DESCRIPTION',
+                'LOCAL POINT OF DELIVERY CODE', 'LOCAL POINT OF DELIVERY DESCRIPTION',
+                'LOCAL CONTRACT CODE', 'LOCAL CONTRACT CODE DESCRIPTION',
+                'LOCAL CONTRACT MONITORING CODE', 'LOCAL CONTRACT MONITORING DESCRIPTION',
+                'CONTRACT MONITORING ADDITIONAL DETAIL',
+                'CONTRACT MONITORING ADDITIONAL DESCRIPTION', 'TARIFF CODE',
+                'NATIONAL TARIFF INDICATOR', 'CONTRACT MONITORING PLANNED ACTIVITY',
+                'CONTRACT MONITORING PLANNED PRICE',
+                'CONTRACT MONITORING PLANNED MARKET FORCES FACTOR',
+                'NAME OF SUBMITTER'
                 ], name='Column name')
 
                 requirement = columns.map(REQUIREMENT_MAP).rename("Field requirement")
 
-                status = pd.Series([
-                    format_status_for_output(to_1_based_indices(validate_year_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_datetime_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_cop_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_of_treatment_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_commissioner_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_activity_TFC_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_local_sub_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_comm_serial_n_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_provider_ref_identifier_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_nhs_service_cat_n_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_commissioned_service_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_service_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_pod_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_pod_further_detail_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_pod_further_detail_desc_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_local_pod_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_local_pod_desc_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_tariff_code_columns(df))),
-                    format_status_for_output(to_1_based_indices(validate_local_price_columns(df))),
-                ], name="Status")
+                raw_results = [
+                    validate_month_columns(df),
+                    validate_year_columns(df),
+                    validate_datetime_columns(df),
+                    validate_cop_columns(df),
+                    validate_of_treatment_columns(df),
+                    validate_gp_practice_columns(df),
+                    validate_residence_resp_columns(df),
+                    validate_commissioner_code_columns(df),
+                    validate_patient_reg_columns(df),
+                    validate_activity_TFC_columns(df),
+                    validate_local_sub_columns(df),
+                    validate_ward_code_columns(df),
+                    validate_commissioned_service_code_columns(df),
+                    validate_service_code_columns(df),
+                    validate_specialised_mental_health_code_columns(df),
+                    validate_pod_code_columns(df),
+                    validate_pod_further_detail_code_columns(df),
+                    validate_pod_further_detail_desc_columns(df),
+                    validate_local_pod_code_columns(df),
+                    validate_local_pod_desc_columns(df),
+                    validate_local_contract_code_columns(df),
+                    validate_local_contract_code_desc_columns(df),
+                    validate_local_contract_monitoring_code_columns(df),
+                    validate_local_contract_monitoring_desc_columns(df),
+                    validate_contract_monitoring_detail_columns(df),
+                    validate_contract_monitoring_desc_columns(df),
+                    validate_tariff_code_columns(df),
+                    validate_tariff_indicator_columns(df),
+                    validate_contract_monitoring_activity_columns(df),
+                    validate_contract_monitoring_price_columns(df),
+                    validate_contract_monitoring_market_columns(df),
+                    validate_name_of_submitter_columns(df),]
+
+                status = pd.Series(
+                    [
+                        build_status_with_invalid_values(df, col, result)
+                        for col, result in zip(columns, raw_results)],
+                    name="Status")
+
 
                 def build_note(df: pd.DataFrame, col: str) -> str:
                     if col in BLANK_WHEN_NON_ACTIVITY_POD_FIELDS and non_activity_blank_rule_triggered(df, col):
                         return BLANK_RULE_NOTE
+
+                    if col == "CONTRACT MONITORING PLANNED ACTIVITY" and non_activity_zero_rule_triggered(df, col):
+                        return CONTR_MON_PLAN_ACT_RULE_NOTE
 
                     if col == "TARIFF CODE" and tariff_rule_triggered(df):
                         return TARIFF_RULE_NOTE
@@ -801,7 +1375,8 @@ if st.button("Run checks", type="primary"):
         except Exception as e:
             st.error(f"Failed to read CSV file. {e}")
 
-# ---------------------- Results  ----------------------
+# ---------------------- Results ----------------------
+
 if st.session_state.calc_done and st.session_state.final_df is not None:
     st.subheader("Results")
 
@@ -809,7 +1384,7 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
         st.markdown(
             """
             <div style="font-size:1.05rem; font-weight:600; line-height:1.3;">
-                Local Prices Reporting DQ results
+                IAP DQ results
             </div>
             """,
             unsafe_allow_html=True,)
@@ -824,7 +1399,7 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
             st.download_button(
                 label="⬇️ Download CSV",
                 data=st.session_state.csv_bytes,
-                file_name="Analysed Local Prices DQ checks.csv",
+                file_name="Analysed IAP DQ checks.csv",
                 mime="text/csv",
                 key="dq_download_btn",
                 use_container_width=True)
@@ -832,7 +1407,7 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
     # Inline preview that persists across reruns (only Status column coloured)
     if st.session_state.show_preview:
         with st.container(border=True):
-            st.markdown("**This table shows which columns in your Local Prices Reporting are valid. If data is invalid, the Status column lists the row numbers with incorrect formatting** (if less than 100 records).")
+            st.markdown("**This table shows which columns in your IAP Reporting are valid. If data is invalid, the Status column lists the invalid values.**")
             styled = style_results_table(st.session_state.final_df)
             st.dataframe(
                 styled,
@@ -842,8 +1417,11 @@ if st.session_state.calc_done and st.session_state.final_df is not None:
             st.button("Close preview", key="close_preview_btn", on_click=lambda: st.session_state.update(show_preview=False))
 
 
-# ---------------------- Important note (always visible at the bottom) ----------------------
-st.write('')
-st.write('')
-st.warning("**Please note that uploading and processing DQ checks through this tool does not constitute data submission. " \
-"This tool is solely intended to assess the formatting of your file.**")
+# ---------------------- Important note ----------------------
+
+st.write("")
+st.write("")
+st.warning(
+    "**Please note that uploading and processing DQ checks through this tool does not "
+    "constitute data submission. This tool is solely intended to assess the formatting "
+    "of your file.**")
